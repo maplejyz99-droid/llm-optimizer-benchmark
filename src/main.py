@@ -514,7 +514,7 @@ def get_exp_name(
     # Set the custom exp name if needed
     if args.experiment_name is not None:
         return args.experiment_name
-    
+
     # Get the default values
     defaults = vars(parser.parse_args([]))
 
