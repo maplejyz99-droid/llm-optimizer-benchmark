@@ -72,9 +72,10 @@ def update_fn(
         elif mars_type == "mars-shampoo" and is_grad_2d:
             factor = max(1, grad.size(0) / grad.size(1)) ** 0.5
             real_update_tmp = (
-                zeropower_via_newtonschulz5(exp_avg.mul(1.0 / (1.0 - beta1)), eps=eps)
+                zeropower_via_newtonschulz5(exp_avg.mul(1.0 / (1.0 - beta1)), steps=10)
                 .mul(factor)
-                .add(wd, p.data)
+                .add(p.data, alpha=wd)
+
                 .mul(-lr)
             )
         p.data.add_(real_update_tmp)

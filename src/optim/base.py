@@ -9,12 +9,14 @@ import wandb
 import yaml
 
 from logger.logger import DynamicsLogger
+from notify import maybe_notify
 from optim.weight_averaging import (ExponentialWeightAverager, WeightAverager,
                                     eval_ewa, eval_wa)
 
-from .utils import (eval, get_batch, get_parameter_norms, load_checkpoint,
-                    load_worker_state, log_prodigy_lr, save_checkpoint,
-                    save_worker_state, visualize_routing)
+from .utils import (eval, extend_onecycle_total_steps, get_batch,
+                    get_parameter_norms, load_checkpoint, load_worker_state,
+                    log_prodigy_lr, save_checkpoint, save_worker_state,
+                    visualize_routing)
 
 
 def train(
@@ -57,6 +59,7 @@ def train(
             cfg.device,
         )
         load_worker_state(ckpt_dir)
+        extend_onecycle_total_steps(scheduler, cfg.iterations)
     else:
         curr_iter = 0
 
@@ -102,6 +105,12 @@ def train(
     train_reader, val_reader = datareaders["train"], datareaders["val"]
     train_reader.set_step(substep)
     stats = {"train_loss": [], "val_loss": [], "val_pp": [], "val_acc": []}
+    last_train_loss = None
+    last_iter_dt = None
+    last_lr = None
+    last_val_loss = None
+    last_val_pp = None
+    last_val_acc = None
     grad_norms = []
     model.train()
 
@@ -130,7 +139,11 @@ def train(
             or curr_iter == cfg.iterations
             or (curr_iter in cfg.full_eval_at)
         ):
-            eval_and_log(
+            (
+                last_val_loss,
+                last_val_pp,
+                last_val_acc,
+            ) = eval_and_log(
                 tokens,
                 curr_iter,
                 epoch,
@@ -240,6 +253,7 @@ def train(
         dt = (time.perf_counter_ns() - t_start) / 1e9
 
         curr_iter += 1
+        last_iter_dt = dt
 
         if (
             cfg.log_interval
@@ -247,11 +261,13 @@ def train(
             and distributed_backend.is_master_process()  # Only log on master rank
         ):
             train_loss = loss.detach().cpu().item() * cfg.acc_steps
+            last_train_loss = train_loss
             train_aux_losses = {
                 f"train/{k}": v for k, v in outputs["aux_losses"].items()
             }
 
             current_lrs = [param_group["lr"] for param_group in opt.param_groups]
+            last_lr = current_lrs[0]
 
             if cfg.opt == "prodigy":
                 prodigy_efective_lrs = log_prodigy_lr(opt)
@@ -291,6 +307,21 @@ def train(
 
             grad_norms = []
 
+        if distributed_backend.is_master_process():
+            current_lrs = [param_group["lr"] for param_group in opt.param_groups]
+            maybe_notify(
+                cfg,
+                curr_iter=curr_iter,
+                epoch=epoch,
+                train_loss=last_train_loss,
+                val_loss=last_val_loss,
+                val_pp=last_val_pp,
+                val_acc=last_val_acc,
+                lr=current_lrs[0] if current_lrs else last_lr,
+                iter_dt=last_iter_dt,
+                run_name=exp_dir.name,
+            )
+
     return stats
 
 
@@ -308,7 +339,7 @@ def eval_and_log(
 ):
     if not distributed_backend.is_master_process():
         # Only evaluate and log on master rank
-        return
+        return None, None, None
 
     model.eval()
     if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
@@ -379,3 +410,4 @@ def eval_and_log(
             # why a copy? see github.com/wandb/wandb/issues/2981
             wandb.log({f"generated-text-{wandb.run.name}": copy.copy(text_table)})
     model.train()
+    return val_loss, val_perplexity, val_acc

@@ -198,6 +198,67 @@ def load_checkpoint(model, opt, scheduler, ckpt_path, device):
     return itr
 
 
+
+def extend_onecycle_total_steps(scheduler, new_total_steps):
+    if scheduler is None:
+        return
+    schedulers = (
+        scheduler.schedulers if hasattr(scheduler, "schedulers") else [scheduler]
+    )
+    for sched in schedulers:
+        if not hasattr(sched, "total_steps"):
+            continue
+        if new_total_steps <= sched.total_steps:
+            continue
+        if hasattr(sched, "_schedule_phases") and sched._schedule_phases:
+            pct_start = (sched._schedule_phases[0]["end_step"] + 1) / sched.total_steps
+            three_phase = len(sched._schedule_phases) == 3
+            sched.total_steps = new_total_steps
+            if three_phase:
+                sched._schedule_phases = [
+                    {
+                        "end_step": float(pct_start * new_total_steps) - 1,
+                        "start_lr": "initial_lr",
+                        "end_lr": "max_lr",
+                        "start_momentum": "max_momentum",
+                        "end_momentum": "base_momentum",
+                    },
+                    {
+                        "end_step": float(2 * pct_start * new_total_steps) - 2,
+                        "start_lr": "max_lr",
+                        "end_lr": "initial_lr",
+                        "start_momentum": "base_momentum",
+                        "end_momentum": "max_momentum",
+                    },
+                    {
+                        "end_step": new_total_steps - 1,
+                        "start_lr": "initial_lr",
+                        "end_lr": "min_lr",
+                        "start_momentum": "max_momentum",
+                        "end_momentum": "max_momentum",
+                    },
+                ]
+            else:
+                sched._schedule_phases = [
+                    {
+                        "end_step": float(pct_start * new_total_steps) - 1,
+                        "start_lr": "initial_lr",
+                        "end_lr": "max_lr",
+                        "start_momentum": "max_momentum",
+                        "end_momentum": "base_momentum",
+                    },
+                    {
+                        "end_step": new_total_steps - 1,
+                        "start_lr": "max_lr",
+                        "end_lr": "min_lr",
+                        "start_momentum": "base_momentum",
+                        "end_momentum": "max_momentum",
+                    },
+                ]
+        else:
+            sched.total_steps = new_total_steps
+
+
 def save_worker_state(ckpt_dir: Path):
     # Dataloader, rng states
     worker_state = {
@@ -213,7 +274,7 @@ def save_worker_state(ckpt_dir: Path):
 
 def load_worker_state(ckpt_dir: Path):
     rank = 0 if not dist.is_initialized() else dist.get_rank()
-    worker_state = torch.load(ckpt_dir / f"worker_{rank}.pt")
+    worker_state = torch.load(ckpt_dir / f"worker_{rank}.pt", weights_only=False)
     torch.random.set_rng_state(worker_state["rng_torch_cpu"])
     torch.cuda.set_rng_state(worker_state["rng_torch_gpu"])
     np.random.set_state(worker_state["rng_np"])

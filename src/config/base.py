@@ -53,6 +53,24 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--wandb_entity", default=None, type=none_or_str)
     parser.add_argument("--log_parameter_norms", action="store_true")
     parser.add_argument("--norm_order", default=2)
+    # Notifications (email/webhook/stdout)
+    parser.add_argument("--notify_interval", default=0, type=int)
+    parser.add_argument(
+        "--notify_method",
+        default="stdout",
+        choices=["stdout", "email", "webhook", "pushplus"],
+    )
+    parser.add_argument("--notify_email_to", default=None, type=none_or_str)
+    parser.add_argument("--notify_email_from", default=None, type=none_or_str)
+    parser.add_argument("--notify_smtp_host", default=None, type=none_or_str)
+    parser.add_argument("--notify_smtp_port", default=None, type=none_or_str)
+    parser.add_argument("--notify_smtp_user", default=None, type=none_or_str)
+    parser.add_argument("--notify_smtp_pass", default=None, type=none_or_str)
+    parser.add_argument("--notify_webhook", default=None, type=none_or_str)
+    parser.add_argument("--notify_pushplus_token", default=None, type=none_or_str)
+    parser.add_argument("--notify_pushplus_topic", default=None, type=none_or_str)
+    parser.add_argument("--notify_pushplus_template", default=None, type=none_or_str)
+    parser.add_argument("--notify_pushplus_url", default=None, type=none_or_str)
 
     # Schedule
     parser.add_argument(
