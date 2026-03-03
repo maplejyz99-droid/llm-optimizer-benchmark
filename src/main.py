@@ -105,7 +105,6 @@ def main(args, parser):
             return True
         lowered = param_name.lower()
         return ("attn" in lowered) or ("mlp" in lowered)
-
     optimized_params_cnt = 0
     for g in group_specs:
         params = []

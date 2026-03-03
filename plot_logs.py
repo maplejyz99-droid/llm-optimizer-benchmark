@@ -1,57 +1,63 @@
 #!/usr/bin/env python3
 import re
-import sys
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# 训练配置 -> 用来把 iter 转成 tokens
+LOGS = [
+    "/root/work/llm-optimizer-benchmark/logs/adamw_124m_15B.log",
+    "/root/work/llm-optimizer-benchmark/logs/adopt_124m_1p5B.log",
+    "/root/work/llm-optimizer-benchmark/logs/lion_124m_1p5B.log",
+    "/root/work/llm-optimizer-benchmark/logs/marsadamw_124m_1p5B_gpu1.log",
+    "/root/work/llm-optimizer-benchmark/logs/marslion_124m_1p5B_gpu2.log",
+    "/root/work/llm-optimizer-benchmark/logs/marsshampoo_124m_1p5B_gpu3.log",
+    "/root/work/llm-optimizer-benchmark/logs/sfadamw_124m_1p5B_gpu3.log",
+    "/root/work/llm-optimizer-benchmark/logs/signum_124m_1p5B.log",
+    "/root/work/llm-optimizer-benchmark/logs/soap_124m_1p5B_gpu0.log",
+    "/root/work/llm-optimizer-benchmark/logs/sophiag_124m_1p5B_b16a2_gpu1.log",
+]
+
 BATCH = 32
 SEQ = 512
 ACC = 1
 WORLD = 1
 TOKENS_PER_ITER = BATCH * SEQ * ACC * WORLD
 
-MIN_TOKENS_B = 0.0
-SKIP_LAST_EVAL = True  # 如需去掉最后一次 full-eval，改为 True
+MIN_TOKENS_B = 0.15
 EVAL_RE = re.compile(r">Eval: Iter=(\d+).*?val_loss=([0-9.]+)")
 
-# 输出图片路径（本机路径）
-OUT_PATH = "/Users/jiujiujiu/Desktop/muon_compare.png"
-
 def label_from_name(path):
-    return Path(path).stem
+    stem = Path(path).stem
+    stem = re.sub(r"_124m.*", "", stem)
+    stem = re.sub(r"_gpu\d+", "", stem)
+    return stem
 
 def main():
     plt.figure(figsize=(9,5))
     all_ys = []
     final_points = []
 
-    log_paths = sys.argv[1:]
-    if not log_paths:
-        print("Please provide log files, e.g.:")
-        print("  python plot_logs.py /path/to/log1.log /path/to/log2.log")
-        return
-
-    for log_path in log_paths:
+    for log_path in LOGS:
         p = Path(log_path)
         if not p.exists():
             print(f"[WARN] missing {log_path}")
             continue
 
-        points = []
+        eval_points = []
         for line in p.read_text(errors="ignore").splitlines():
             m = EVAL_RE.search(line)
             if m:
-                points.append((int(m.group(1)), float(m.group(2))))
-        if SKIP_LAST_EVAL and points:
-            points = points[:-1]
+                it = int(m.group(1))
+                loss = float(m.group(2))
+                tokens_b = it * TOKENS_PER_ITER / 1e9
+                if tokens_b >= MIN_TOKENS_B:
+                    eval_points.append((it, tokens_b, loss))
 
-        xs, ys = [], []
-        for it, loss in points:
-            tokens_b = it * TOKENS_PER_ITER / 1e9
-            if tokens_b >= MIN_TOKENS_B:
-                xs.append(tokens_b)
-                ys.append(loss)
+        if eval_points:
+            max_iter = max(it for it, _, _ in eval_points)
+            eval_points = [pt for pt in eval_points if pt[0] < max_iter]
+
+        xs = [t for _, t, _ in eval_points]
+        ys = [l for _, _, l in eval_points]
 
         if xs:
             label = label_from_name(log_path)
@@ -63,7 +69,7 @@ def main():
 
     plt.xlabel("Tokens (B)")
     plt.ylabel("Validation Loss")
-    plt.title(f"124M SlimPajama 1.5B — Optimizer Curves (>= {MIN_TOKENS_B}B)")
+    plt.title("124M SlimPajama 1.5B — Optimizer Curves (>=0.15B)")
     plt.grid(alpha=0.3)
 
     if all_ys:
@@ -91,8 +97,7 @@ def main():
     )
 
     plt.tight_layout()
-    out = Path(OUT_PATH)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = "/root/work/llm-optimizer-benchmark/optimizer_curves_1p5B_ranked.png"
     plt.savefig(out, dpi=200, bbox_inches="tight")
     print("Saved:", out)
 
