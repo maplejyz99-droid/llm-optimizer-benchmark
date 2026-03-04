@@ -19,6 +19,7 @@ from optim.adafactor import Adafactor
 from optim.ademamix import AdEMAMix
 from optim.adopt import ADOPT
 from optim.base import train
+from optim.cadamw import CAdamW
 from optim.lamb import Lamb
 from optim.lion import Lion
 from optim.mars import MARS
@@ -152,6 +153,15 @@ def main(args, parser):
             betas=(args.beta1, args.beta2),
             weight_decay=args.weight_decay,
             **extra_args,
+        )
+    elif args.opt == "cadamw":
+        opt = CAdamW(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            eps=1e-8,
+            cautious_xi=args.cautious_xi,
         )
     elif args.opt == "soap":
         opt = SOAP(

@@ -102,6 +102,7 @@ def parse_args(base_parser, args, namespace):
         default="adamw",
         choices=[
             "adamw",
+            "cadamw",
             "adamw-magma",
             "sgd",
             "muon",
@@ -145,6 +146,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--nesterov", default=False, type=bool)
     parser.add_argument("--muon_ns_steps", default=5, type=int)
     parser.add_argument("--muon_lr_factor", default=1.0, type=float)
+    parser.add_argument("--cautious_xi", default=1.0, type=float)
     parser.add_argument("--magma_survival_p", default=0.5, type=float)
     parser.add_argument("--magma_tau", default=2.0, type=float)
     parser.add_argument("--magma_beta", default=0.9, type=float)
