@@ -43,6 +43,33 @@ The above command trains a 123.59M parameters model with the Llama-style archite
 We [present](https://github.com/epfml/llm-optimizer-benchmark/tree/dev/scripts) scripts for reproducing our benchmarking results for 124M, 210M, 720M dense Llama-based models, and 520M MoEs.
 Set the [wandb logging](#using-wandb) and run those scripts to obtain the results as below.
 
+### Gauss-Newton experiments
+
+This repo now includes two GN options:
+
+- `--opt gn-prox`: prox-linear (JVP-based) inner updates
+- `--opt gn-full`: full Gauss-Newton inner updates
+
+Example scripts:
+
+- `scripts/124m/gn-prox.sh`
+- `scripts/124m/gn-full.sh`
+- `scripts/210m/gn-prox.sh`
+- `scripts/210m/gn-full.sh`
+- `scripts/720m/gn-prox.sh`
+- `scripts/720m/gn-full.sh`
+- `scripts/moe-520m/gn-prox.sh`
+- `scripts/moe-520m/gn-full.sh`
+
+Key GN flags:
+
+- `--gn_inner_iters`
+- `--gn_inner_lr`
+- `--gn_inner_b1`, `--gn_inner_b2`
+- `--gn_inner_wd` (proximal penalty on parameter delta)
+- `--gn_linesearch`, `--gn_ls_range`
+- `--gn_log_inner_steps`
+
 <p align="center">
   <img src="assets/720m_losses_1.png" alt="SF, Signum, Lion, Sophia" width="30%" style="display:inline-block; margin: 5px;"/>
   <img src="assets/720m_losses_2.png" alt="Prod, ADOPT, SOAP, AdamW" width="30%" style="display:inline-block; margin: 5px;"/>

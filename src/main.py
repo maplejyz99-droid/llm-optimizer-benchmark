@@ -154,6 +154,21 @@ def main(args, parser):
             weight_decay=args.weight_decay,
             **extra_args,
         )
+    elif args.opt == "gn-prox" or args.opt == "gn-full":
+        device_type = "cuda" if "cuda" in args.device else "cpu"
+        use_fused = (device_type == "cuda") and (
+            "fused" in inspect.signature(torch.optim.AdamW).parameters
+        )
+        print(f"using fused GN inner AdamW: {use_fused}")
+        extra_args = dict(fused=True) if use_fused else dict()
+        opt = torch.optim.AdamW(
+            group_specs,
+            lr=args.gn_inner_lr,
+            betas=(args.gn_inner_b1, args.gn_inner_b2),
+            # Proximal regularization is applied explicitly in the GN objective.
+            weight_decay=0.0,
+            **extra_args,
+        )
     elif args.opt == "cadamw":
         opt = CAdamW(
             group_specs,
@@ -418,6 +433,7 @@ def main(args, parser):
         assert (
             args.warmup_steps < args.iterations
         ), "Warmup steps must be < iterations."  # from schedules-and-scaling
+        sched_base_lr = args.gn_inner_lr if args.opt in {"gn-prox", "gn-full"} else args.lr
         if args.scheduler in ["cos", "linear"]:
             # initial lr is args.lr / div_factor
             # final lr is initial_lr/final_div_factor = args.lr / div_factor / final_div_factor
@@ -425,7 +441,7 @@ def main(args, parser):
                 torch.optim.lr_scheduler.OneCycleLR(
                     optimizer=opt,
                     max_lr=[
-                        group.get("lr", args.lr) for group in group_specs
+                        group.get("lr", sched_base_lr) for group in group_specs
                     ],  # it was args.lr
                     total_steps=args.iterations,
                     pct_start=args.warmup_steps

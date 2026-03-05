@@ -102,6 +102,8 @@ def parse_args(base_parser, args, namespace):
         default="adamw",
         choices=[
             "adamw",
+            "gn-prox",
+            "gn-full",
             "cadamw",
             "adamw-magma",
             "sgd",
@@ -191,6 +193,14 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--scion_lmh_scale", default=10.0, type=float)
     parser.add_argument("--scion_emb_scale", default=1.0, type=float)
     parser.add_argument("--scion_tr_scale", default=3.0, type=float)
+    parser.add_argument("--gn_inner_iters", default=8, type=int)
+    parser.add_argument("--gn_inner_lr", default=1e-3, type=float)
+    parser.add_argument("--gn_inner_b1", default=0.9, type=float)
+    parser.add_argument("--gn_inner_b2", default=0.999, type=float)
+    parser.add_argument("--gn_inner_wd", default=0.0, type=float)
+    parser.add_argument("--gn_linesearch", action="store_true")
+    parser.add_argument("--gn_ls_range", default=5, type=int)
+    parser.add_argument("--gn_log_inner_steps", action="store_true")
     parser.add_argument(
         "--weight_average", action="store_true"
     )  # uniform weight averaging (or SWA)

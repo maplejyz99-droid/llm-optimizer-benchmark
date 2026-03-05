@@ -13,6 +13,9 @@ from notify import maybe_notify
 from optim.weight_averaging import (ExponentialWeightAverager, WeightAverager,
                                     eval_ewa, eval_wa)
 
+from .gn import (clone_param_dict, clone_param_dict_from_named_params,
+                 compute_gn_step, current_param_dict, line_search_over_direction,
+                 sub_param_dict)
 from .utils import (eval, extend_onecycle_total_steps, get_batch,
                     get_parameter_norms, load_checkpoint, load_worker_state,
                     log_prodigy_lr, save_checkpoint, save_worker_state,
@@ -113,6 +116,7 @@ def train(
     last_val_acc = None
     grad_norms = []
     model.train()
+    use_gn = cfg.opt in {"gn-prox", "gn-full"}
 
     while curr_iter <= cfg.iterations:
         # Save permanent checkpoint
@@ -186,62 +190,148 @@ def train(
 
         # Train model
         t_start = time.perf_counter_ns()
-        for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
-            x, y = get_batch(train_reader, device=cfg.device)
-            with type_ctx:
-                with distributed_backend.get_context_for_microstep_forward(
-                    model=model,
-                    microstep_idx=microstep_idx,
-                    gradient_accumulation_steps=cfg.acc_steps,
-                ):
-                    outputs = model(x, targets=y, moe=cfg.moe)
+        gn_step_size = None
+        if use_gn:
+            raw_model = distributed_backend.get_raw_model(model)
+            gn_mode = "full" if cfg.opt == "gn-full" else "prox"
+            params = current_param_dict(raw_model)
+            params0 = clone_param_dict(raw_model)
+            gn_metrics = None
 
-            loss = outputs["loss"] / cfg.acc_steps
-            loss.backward()
-            substep += 1
+            for inner_idx in range(cfg.gn_inner_iters):
+                x, y = get_batch(train_reader, device=cfg.device)
+                with type_ctx:
+                    grads, gn_metrics = compute_gn_step(
+                        model=raw_model,
+                        params0=params0,
+                        x=x,
+                        y=y,
+                        mode=gn_mode,
+                        prox_weight_decay=cfg.gn_inner_wd,
+                        moe=cfg.moe,
+                    )
 
-        if cfg.grad_clip != 0.0:
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.module.parameters(), cfg.grad_clip
-                )
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), cfg.grad_clip
-                )
-            grad_norms.append(grad_norm)
+                for param, grad in zip(params.values(), grads):
+                    param.grad = grad.detach()
 
-        if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
-            opt.train()
-        (
-            opt.step()
-            if cfg.opt != "sophiag"
-            else opt.step(bs=cfg.sophia_bs * cfg.sequence_length)
-        )
-        if cfg.scheduler != "none":
-            scheduler.step()
-        if cfg.opt == "sophiag":
-            opt.zero_grad(set_to_none=True)
-            if curr_iter % cfg.precondition_frequency == cfg.precondition_frequency - 1:
-                sample_again = model(x, targets=y, get_logits=True)
-                samp_dist = torch.distributions.Categorical(
-                    logits=sample_again["logits"]
-                )
-                y_sample = samp_dist.sample()
-                loss_sampled = torch.nn.functional.cross_entropy(
-                    sample_again["logits"].view(-1, sample_again["logits"].size(-1)),
-                    y_sample.view(-1),
-                    ignore_index=-1,
-                )
-                (loss_sampled / cfg.acc_steps).backward()
-                opt.update_hessian()
+                if cfg.grad_clip != 0.0:
+                    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.module.parameters(), cfg.grad_clip
+                        )
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), cfg.grad_clip
+                        )
+                    grad_norms.append(grad_norm)
+
+                opt.step()
                 opt.zero_grad(set_to_none=True)
-                model.zero_grad()
-        elif cfg.opt == "mars":
-            opt.zero_grad(set_to_none=True)
-            opt.update_last_grad()
+                substep += 1
+
+                if (
+                    cfg.gn_log_inner_steps
+                    and cfg.wandb
+                    and distributed_backend.is_master_process()
+                    and gn_metrics is not None
+                ):
+                    wandb.log(
+                        {
+                            "iter": curr_iter,
+                            "train/gn_inner_step": curr_iter * cfg.gn_inner_iters + inner_idx,
+                            "train/gn_inner_loss": gn_metrics.loss,
+                            "train/gn_inner_base_loss": gn_metrics.base_loss,
+                            "train/gn_inner_grad_norm": gn_metrics.gradient_norm,
+                            "train/gn_inner_param_norm": gn_metrics.param_norm,
+                        }
+                    )
+
+            if gn_metrics is None:
+                raise RuntimeError("GN step did not produce metrics.")
+
+            if cfg.gn_linesearch:
+                current_params = clone_param_dict_from_named_params(params)
+                direction = sub_param_dict(current_params, params0)
+                line_search_batches = [
+                    get_batch(train_reader, device=cfg.device)
+                    for _ in range(cfg.gn_inner_iters)
+                ]
+                substep += len(line_search_batches)
+                gn_step_size, _ = line_search_over_direction(
+                    model=raw_model,
+                    anchor_params=params0,
+                    direction=direction,
+                    batches=line_search_batches,
+                    moe=cfg.moe,
+                    ls_range=cfg.gn_ls_range,
+                )
+
+            loss = torch.tensor(gn_metrics.base_loss, device=cfg.device)
+            outputs = {
+                "loss": loss,
+                "aux_losses": {},
+            }
+            grad_norms.append(torch.tensor(gn_metrics.gradient_norm))
         else:
-            opt.zero_grad(set_to_none=True)
+            for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
+                x, y = get_batch(train_reader, device=cfg.device)
+                with type_ctx:
+                    with distributed_backend.get_context_for_microstep_forward(
+                        model=model,
+                        microstep_idx=microstep_idx,
+                        gradient_accumulation_steps=cfg.acc_steps,
+                    ):
+                        outputs = model(x, targets=y, moe=cfg.moe)
+
+                loss = outputs["loss"] / cfg.acc_steps
+                loss.backward()
+                substep += 1
+
+            if cfg.grad_clip != 0.0:
+                if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.module.parameters(), cfg.grad_clip
+                    )
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), cfg.grad_clip
+                    )
+                grad_norms.append(grad_norm)
+
+            if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
+                opt.train()
+            (
+                opt.step()
+                if cfg.opt != "sophiag"
+                else opt.step(bs=cfg.sophia_bs * cfg.sequence_length)
+            )
+            if cfg.scheduler != "none":
+                scheduler.step()
+            if cfg.opt == "sophiag":
+                opt.zero_grad(set_to_none=True)
+                if curr_iter % cfg.precondition_frequency == cfg.precondition_frequency - 1:
+                    sample_again = model(x, targets=y, get_logits=True)
+                    samp_dist = torch.distributions.Categorical(
+                        logits=sample_again["logits"]
+                    )
+                    y_sample = samp_dist.sample()
+                    loss_sampled = torch.nn.functional.cross_entropy(
+                        sample_again["logits"].view(-1, sample_again["logits"].size(-1)),
+                        y_sample.view(-1),
+                        ignore_index=-1,
+                    )
+                    (loss_sampled / cfg.acc_steps).backward()
+                    opt.update_hessian()
+                    opt.zero_grad(set_to_none=True)
+                    model.zero_grad()
+            elif cfg.opt == "mars":
+                opt.zero_grad(set_to_none=True)
+                opt.update_last_grad()
+            else:
+                opt.zero_grad(set_to_none=True)
+
+        if cfg.scheduler != "none" and use_gn:
+            scheduler.step()
 
         if cfg.weight_average:
             weight_averager.step(
@@ -261,6 +351,8 @@ def train(
             and distributed_backend.is_master_process()  # Only log on master rank
         ):
             train_loss = loss.detach().cpu().item() * cfg.acc_steps
+            if use_gn:
+                train_loss = loss.detach().cpu().item()
             last_train_loss = train_loss
             train_aux_losses = {
                 f"train/{k}": v for k, v in outputs["aux_losses"].items()
@@ -297,6 +389,8 @@ def train(
 
                 if cfg.opt == "prodigy":
                     wandb_logs["effective_lr"] = prodigy_efective_lrs[0]
+                if use_gn and gn_step_size is not None:
+                    wandb_logs["train/gn_step_size"] = gn_step_size
 
                 if cfg.log_parameter_norms:
                     raw_model = distributed_backend.get_raw_model(model)
