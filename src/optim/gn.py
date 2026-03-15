@@ -124,7 +124,8 @@ def compute_gn_step(
             model,
             (pdict, buffers),
             args=(x,),
-            kwargs={"targets": None, "get_logits": True, "moe": moe},
+            # Request full-sequence logits without triggering model-internal CE loss.
+            kwargs={"targets": None, "get_logits": True, "moe": moe, "full_logits": True},
         )
         return out["logits"]
 
@@ -214,7 +215,14 @@ def line_search_over_direction(
 
         total = 0.0
         for x, y in batches:
-            out = model(x, targets=None, get_logits=True, moe=moe)
+            # Keep line-search loss consistent with GN objective on full tokens.
+            out = model(
+                x,
+                targets=None,
+                get_logits=True,
+                moe=moe,
+                full_logits=True,
+            )
             logits = out["logits"]
             total += _cross_entropy_from_logits(logits, y).item()
         avg_loss = total / len(batches)

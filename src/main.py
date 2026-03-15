@@ -91,6 +91,16 @@ def main(args, parser):
     model = get_model(args).to(
         args.device
     )  # todo: take care of initializing the model if args.use_pretrained != 'none'
+    if args.opt in {"gn-prox", "gn-full"}:
+        # GN uses torch.func JVP; force math SDP backend to avoid Flash forward-AD errors.
+        if "cuda" in args.device:
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+            if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                torch.backends.cuda.enable_math_sdp(True)
+        print("GN mode: force math SDP backend for forward-AD compatibility.")
     print(f"\nModel:\n{model}")
 
     model = distributed_backend.transform_model(model)

@@ -219,7 +219,7 @@ class MuPLlama(GPTBase):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-    def forward(self, idx, targets=None, get_logits=False, moe=False):
+    def forward(self, idx, targets=None, get_logits=False, moe=False, full_logits=False):
         device = idx.device
         b, t = idx.size()
         assert (
@@ -271,6 +271,11 @@ class MuPLlama(GPTBase):
                                 * getattr(self.config, k + "_factor")
                                 / self.config.n_layer
                             )
+        elif get_logits and full_logits:
+            # Return full-sequence logits without forcing CE computation.
+            logits = self.lm_head(x)
+            logits = logits / (self.config.n_embd / self.config.scale_base_model)
+            loss = None
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(

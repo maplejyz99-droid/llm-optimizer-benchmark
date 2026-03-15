@@ -4,6 +4,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 LOGS = [
+
     "/root/work/llm-optimizer-benchmark/logs/adamw_124m_15B.log",
     "/root/work/llm-optimizer-benchmark/logs/adopt_124m_1p5B.log",
     "/root/work/llm-optimizer-benchmark/logs/lion_124m_1p5B.log",
@@ -14,7 +15,11 @@ LOGS = [
     "/root/work/llm-optimizer-benchmark/logs/signum_124m_1p5B.log",
     "/root/work/llm-optimizer-benchmark/logs/soap_124m_1p5B_gpu0.log",
     "/root/work/llm-optimizer-benchmark/logs/sophiag_124m_1p5B_b16a2_gpu1.log",
+    "/root/work/llm-optimizer-benchmark/logs/cadamw_124m_1p5B_gpu0.log",
+    "/root/work/llm-optimizer-benchmark/logs/adamw_magma_124m_1p5B_gpu1.log",
+
 ]
+
 
 BATCH = 32
 SEQ = 512
