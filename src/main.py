@@ -9,7 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import wandb
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 import config
 import distributed
@@ -25,6 +29,7 @@ from optim.lion import Lion
 from optim.mars import MARS
 from optim.magma import MagmaAdamW, MagmaMuon
 from optim.muon import CombinedScheduler, DistributedMuon, Muon
+from optim.newton_muon import NewtonMuon
 from optim.prodigy import Prodigy
 from optim.schedule import cos_inf_schedule, wsd_schedule
 from optim.schedulefree import AdamWScheduleFree, SGDScheduleFree
@@ -50,9 +55,20 @@ def get_args():
 
 
 def main(args, parser):
+    if args.opt == "newton-muon" and args.distributed_backend is not None:
+        raise ValueError("Newton-Muon v1 only supports single-device dense Llama.")
     distributed_backend = distributed.make_backend_from_args(args)
     args = distributed_backend.get_adjusted_args_for_process(args)
     args.world_size = distributed_backend.get_world_size()
+    if args.opt == "newton-muon":
+        if args.world_size != 1:
+            raise ValueError("Newton-Muon v1 only supports world_size=1.")
+        if args.moe:
+            raise ValueError("Newton-Muon v1 does not support MoE models.")
+        if args.model != "llama":
+            raise ValueError("Newton-Muon v1 only supports --model llama.")
+    if args.wandb and wandb is None:
+        raise ImportError("wandb is not installed; rerun without --wandb or install wandb.")
 
     if args.full_eval_at is None:
         args.full_eval_at = []
@@ -221,6 +237,26 @@ def main(args, parser):
             adamw_eps=1e-8,
             adamw_wd=args.weight_decay,
         )
+    elif args.opt == "newton-muon":
+        param_list = list(model.parameters())
+        opt = NewtonMuon(
+            muon_params=param_list,
+            lr=args.muon_lr_factor,
+            momentum=args.momentum,
+            nesterov=args.nesterov,
+            ns_steps=args.muon_ns_steps,
+            adamw_params=None,
+            adamw_lr=args.lr,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            adamw_wd=args.weight_decay,
+            precond_every=args.newton_muon_precond_every,
+            precond_ewma=args.newton_muon_precond_ewma,
+            precond_init_diag=args.newton_muon_precond_init_diag,
+            precond_ridge_mult=args.newton_muon_precond_ridge_mult,
+            precond_eps=args.newton_muon_precond_eps,
+        )
+        opt.attach_preconditioner(model)
     elif args.opt == "muon-magma":
         param_list = (
             list(model.parameters())
@@ -461,7 +497,7 @@ def main(args, parser):
                     div_factor=1e2,
                     final_div_factor=args.final_div_factor,
                 )
-                if args.opt not in {"muon", "muon-magma"}
+                if args.opt not in {"muon", "muon-magma", "newton-muon"}
                 else CombinedScheduler(opt, args)
             )
         elif args.scheduler == "cos_inf":
@@ -474,7 +510,7 @@ def main(args, parser):
             )
             scheduler = (
                 torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
-                if args.opt not in {"muon", "muon-magma"}
+                if args.opt not in {"muon", "muon-magma", "newton-muon"}
                 else CombinedScheduler(opt, args)
             )
         elif args.scheduler == "wsd":
@@ -488,7 +524,7 @@ def main(args, parser):
             )
             scheduler = (
                 torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
-                if args.opt not in {"muon", "muon-magma"}
+                if args.opt not in {"muon", "muon-magma", "newton-muon"}
                 else CombinedScheduler(opt, args)
             )
         else:

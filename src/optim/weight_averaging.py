@@ -3,7 +3,11 @@ from copy import deepcopy
 from pathlib import Path
 
 import torch
-import wandb
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from .utils import eval
 

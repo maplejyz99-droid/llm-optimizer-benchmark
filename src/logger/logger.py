@@ -6,7 +6,11 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-import wandb
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 class DynamicsLogger:

@@ -70,6 +70,37 @@ Key GN flags:
 - `--gn_linesearch`, `--gn_ls_range`
 - `--gn_log_inner_steps`
 
+### Newton-Muon experiments
+
+This fork includes a single-card dense Llama Newton-Muon v1 option:
+
+- `--opt newton-muon`: Muon plus an activation-covariance right-preconditioner
+
+Example script:
+
+- `scripts/124m/newton-muon.sh`
+
+The 124M script is a small-memory entry using `batch_size=16` and `acc_steps=2`.
+It intentionally does not use `torchrun` or `--distributed_backend`, because this
+Newton-Muon v1 path only supports one device. The script keeps the benchmark-style
+`--wandb` placeholder; remove the `--wandb` flags for local runs without W&B.
+
+Key Newton-Muon flags:
+
+- `--newton_muon_precond_every`: refresh interval in optimizer steps / outer training iterations, not microsteps.
+- `--newton_muon_precond_ewma`: exponential moving average coefficient for activation covariance.
+- `--newton_muon_precond_init_diag`: initial diagonal value for covariance state.
+- `--newton_muon_precond_ridge_mult`, `--newton_muon_precond_eps`: inverse regularization.
+
+Preconditioner statistics are collected during training forward passes only, and
+only on refresh steps. They are not collected after backward. Evaluation forward
+passes do not update covariance: eval uses the normal path and the Llama forward
+only collects when `precond_flag` is true and the model is in training mode.
+
+Current limits: no DDP/multi-card, no MoE, and no `d-muon` semantic alignment.
+Mac CPU/MPS runs are smoke tests only; performance comparisons should be run on a
+single CUDA device.
+
 <p align="center">
   <img src="assets/720m_losses_1.png" alt="SF, Signum, Lion, Sophia" width="30%" style="display:inline-block; margin: 5px;"/>
   <img src="assets/720m_losses_2.png" alt="Prod, ADOPT, SOAP, AdamW" width="30%" style="display:inline-block; margin: 5px;"/>
@@ -112,7 +143,7 @@ parser.add_argument('--beta2', default=0.95, type=float) # adam parameter
 parser.add_argument('--scheduler', default='cos', choices=['linear', 'cos', 'wsd', 'cos_inf', 'none'])
 parser.add_argument('--final_div_factor', default=1, type=float) # cosine and linear schedulers
 parser.add_argument('--cos_inf_steps', default=0, type=int) # cos_inf scheduler
-parser.add_argument('--opt', default='adamw', choices=['adamw', 'sgd', 'muon', 'soap', 'ademamix', 'lion', 'sf-adamw', 'sf-sgd', 'signsgd', 'signum', 'prodigy', 'sophiag', 'adopt', 'mars', 'adafactor', 'lamb', 'scion', 'scion-light', 'd-muon', 'muon-pytorch'])
+parser.add_argument('--opt', default='adamw', choices=['adamw', 'sgd', 'muon', 'newton-muon', 'soap', 'ademamix', 'lion', 'sf-adamw', 'sf-sgd', 'signsgd', 'signum', 'prodigy', 'sophiag', 'adopt', 'mars', 'adafactor', 'lamb', 'scion', 'scion-light', 'd-muon', 'muon-pytorch'])
 parser.add_argument('--eval_freq', default=200, type=int) # in iterations
 parser.add_argument('--results_base_folder', default="./exps", type=str) # where the checkpoints will be saved
 parser.add_argument('--grad_clip', default=0.0, type=float) # default value is 1.0 in nanoGPT
@@ -128,6 +159,11 @@ parser.add_argument('--correct_bias', default=True, type=bool)
 parser.add_argument('--nesterov', default=False, type=bool) # whether to use Nesterov-style momentum 
 parser.add_argument('--muon_ns_steps', default=5, type=int) # the number of steps to use in the newton schulz, if it is iterative
 parser.add_argument('--muon_lr_factor', default=0.02, type=float) # a factor by which to reduce the lr for muon
+parser.add_argument('--newton_muon_precond_every', default=32, type=int)
+parser.add_argument('--newton_muon_precond_ewma', default=0.95, type=float)
+parser.add_argument('--newton_muon_precond_init_diag', default=1e-3, type=float)
+parser.add_argument('--newton_muon_precond_ridge_mult', default=0.2, type=float)
+parser.add_argument('--newton_muon_precond_eps', default=1e-8, type=float)
 parser.add_argmunet('--adema_beta3', default=0.9, type=float) # beta3 in AdEMAMix
 parser.add_argument('--adema_alpha', default=2.0, type=float) # alpha in AdEMAMix
 parser.add_argument('--adema_beta3_warmup', default=None, type=int) # AdEMAMix hyperparameter

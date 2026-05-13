@@ -108,6 +108,7 @@ def parse_args(base_parser, args, namespace):
             "adamw-magma",
             "sgd",
             "muon",
+            "newton-muon",
             "muon-magma",
             "soap",
             "ademamix",
@@ -148,6 +149,11 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--nesterov", default=False, type=bool)
     parser.add_argument("--muon_ns_steps", default=5, type=int)
     parser.add_argument("--muon_lr_factor", default=1.0, type=float)
+    parser.add_argument("--newton_muon_precond_every", default=32, type=int)
+    parser.add_argument("--newton_muon_precond_ewma", default=0.95, type=float)
+    parser.add_argument("--newton_muon_precond_init_diag", default=1e-3, type=float)
+    parser.add_argument("--newton_muon_precond_ridge_mult", default=0.2, type=float)
+    parser.add_argument("--newton_muon_precond_eps", default=1e-8, type=float)
     parser.add_argument("--cautious_xi", default=1.0, type=float)
     parser.add_argument("--magma_survival_p", default=0.5, type=float)
     parser.add_argument("--magma_tau", default=2.0, type=float)

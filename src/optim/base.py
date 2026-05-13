@@ -5,8 +5,12 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-import wandb
 import yaml
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from logger.logger import DynamicsLogger
 from notify import maybe_notify
@@ -273,6 +277,11 @@ def train(
             }
             grad_norms.append(torch.tensor(gn_metrics.gradient_norm))
         else:
+            precond_flag = (
+                opt.precond_flag_for_step()
+                if hasattr(opt, "precond_flag_for_step")
+                else False
+            )
             for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
                 x, y = get_batch(train_reader, device=cfg.device)
                 with type_ctx:
@@ -281,7 +290,15 @@ def train(
                         microstep_idx=microstep_idx,
                         gradient_accumulation_steps=cfg.acc_steps,
                     ):
-                        outputs = model(x, targets=y, moe=cfg.moe)
+                        if hasattr(opt, "precond_flag_for_step"):
+                            outputs = model(
+                                x,
+                                targets=y,
+                                moe=cfg.moe,
+                                precond_flag=precond_flag,
+                            )
+                        else:
+                            outputs = model(x, targets=y, moe=cfg.moe)
 
                 loss = outputs["loss"] / cfg.acc_steps
                 loss.backward()

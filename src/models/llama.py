@@ -14,6 +14,21 @@ from models.base import CausalSelfAttention, GPTBase
 from models.moe import MoE
 
 
+@torch.no_grad()
+def _accumulate_xtx(x, accum, count, blocks=1):
+    x2d = x.detach().float().reshape(-1, x.shape[-1])
+    if blocks == 1:
+        accum.add_(x2d.transpose(0, 1).matmul(x2d).div_(x2d.size(0)))
+    else:
+        width = x2d.shape[-1]
+        if width % blocks != 0:
+            raise ValueError("Newton-Muon block covariance requires divisible width.")
+        block = width // blocks
+        x_blocks = x2d.reshape(-1, blocks, block).permute(1, 0, 2)
+        accum.add_(torch.bmm(x_blocks.transpose(1, 2), x_blocks).div_(x2d.size(0)))
+    count.add_(1.0)
+
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -88,20 +103,71 @@ class LlamaMLP(nn.Module):
         self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.w2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        self.register_buffer(
+            "newton_muon_fc_accum",
+            torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "newton_muon_fc_count", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+        if hidden_dim % 4 != 0:
+            raise ValueError("Newton-Muon expects Llama MLP hidden_dim divisible by 4.")
+        proj_block = hidden_dim // 4
+        self.register_buffer(
+            "newton_muon_proj_accum",
+            torch.zeros(4, proj_block, proj_block, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "newton_muon_proj_count",
+            torch.zeros((), dtype=torch.float32),
+            persistent=False,
+        )
 
-    def forward(self, x):
+    def forward(self, x, precond_flag=False):
+        if precond_flag:
+            _accumulate_xtx(x, self.newton_muon_fc_accum, self.newton_muon_fc_count)
         # tuple form because of aux loss from MoE
-        return self.c_proj(nn.functional.silu(self.w1(x)) * self.w2(x)), {}
+        x = nn.functional.silu(self.w1(x)) * self.w2(x)
+        if precond_flag:
+            _accumulate_xtx(
+                x, self.newton_muon_proj_accum, self.newton_muon_proj_count, blocks=4
+            )
+        return self.c_proj(x), {}
 
 
 class LlamaAttention(CausalSelfAttention):
-    def forward(self, x, freqs_cis):
+    def __init__(self, config):
+        super().__init__(config)
+        self.register_buffer(
+            "newton_muon_qkv_accum",
+            torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "newton_muon_qkv_count",
+            torch.zeros((), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "newton_muon_o_accum",
+            torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "newton_muon_o_count", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+
+    def forward(self, x, freqs_cis, precond_flag=False):
         # batch size, sequence length, embedding dimensionality (n_embd)
         (
             B,
             T,
             C,
         ) = x.size()
+        if precond_flag:
+            _accumulate_xtx(x, self.newton_muon_qkv_accum, self.newton_muon_qkv_count)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -133,6 +199,8 @@ class LlamaAttention(CausalSelfAttention):
         )  # re-assemble all head outputs side by side
 
         # output projection
+        if precond_flag:
+            _accumulate_xtx(y, self.newton_muon_o_accum, self.newton_muon_o_count)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -149,9 +217,9 @@ class LlamaBlock(nn.Module):
         else:
             self.mlp = LlamaMLP(config)
 
-    def forward(self, x, freqs_cis):
-        x = x + self.attn(self.ln_1(x), freqs_cis)
-        x_, logits_and_experts = self.mlp(self.ln_2(x))
+    def forward(self, x, freqs_cis, precond_flag=False):
+        x = x + self.attn(self.ln_1(x), freqs_cis, precond_flag=precond_flag)
+        x_, logits_and_experts = self.mlp(self.ln_2(x), precond_flag=precond_flag)
         x = x + x_
         return x, logits_and_experts
 
@@ -214,7 +282,15 @@ class Llama(GPTBase):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-    def forward(self, idx, targets=None, get_logits=False, moe=False, full_logits=False):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        get_logits=False,
+        moe=False,
+        full_logits=False,
+        precond_flag=False,
+    ):
         device = idx.device
         b, t = idx.size()
         assert (
@@ -234,8 +310,9 @@ class Llama(GPTBase):
         # experts is a list for each layer's selected experts, shape (b * seq_len, topk)
         experts = []
 
+        precond_flag = bool(precond_flag) and self.training
         for block in self.transformer.h:
-            x, logits_and_experts = block(x, freqs_cis=freqs_cis)
+            x, logits_and_experts = block(x, freqs_cis=freqs_cis, precond_flag=precond_flag)
             if len(logits_and_experts) > 0:
                 router_logits.append(logits_and_experts["router_logits"])
                 experts.append(logits_and_experts["selected_experts"])

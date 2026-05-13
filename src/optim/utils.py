@@ -6,7 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def get_batch(datareader, device="cpu"):
@@ -263,7 +267,7 @@ def save_worker_state(ckpt_dir: Path):
     # Dataloader, rng states
     worker_state = {
         "rng_torch_cpu": torch.random.get_rng_state(),
-        "rng_torch_gpu": torch.cuda.get_rng_state(),
+        "rng_torch_gpu": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
         "rng_np": np.random.get_state(),
         "rng_python": random.getstate(),
     }
@@ -276,7 +280,8 @@ def load_worker_state(ckpt_dir: Path):
     rank = 0 if not dist.is_initialized() else dist.get_rank()
     worker_state = torch.load(ckpt_dir / f"worker_{rank}.pt", weights_only=False)
     torch.random.set_rng_state(worker_state["rng_torch_cpu"])
-    torch.cuda.set_rng_state(worker_state["rng_torch_gpu"])
+    if torch.cuda.is_available() and worker_state["rng_torch_gpu"] is not None:
+        torch.cuda.set_rng_state(worker_state["rng_torch_gpu"])
     np.random.set_state(worker_state["rng_np"])
     random.setstate(worker_state["rng_python"])
 
