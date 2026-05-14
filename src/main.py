@@ -631,6 +631,8 @@ def get_exp_name(
         # "ewa_after_warmup",
         "moe",
         "log_interval",
+        "log_cuda_memory",
+        "cuda_memory_log_interval",
         "log_parameter_norms",
         "log_dynamics",
         "dynamics_logger_cfg",

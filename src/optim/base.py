@@ -26,6 +26,42 @@ from .utils import (eval, extend_onecycle_total_steps, get_batch,
                     visualize_routing)
 
 
+def _cuda_memory_enabled(cfg, distributed_backend):
+    return (
+        getattr(cfg, "log_cuda_memory", False)
+        and "cuda" in cfg.device
+        and torch.cuda.is_available()
+        and distributed_backend.is_master_process()
+    )
+
+
+def _should_log_cuda_memory(cfg, curr_iter):
+    interval = max(1, int(getattr(cfg, "cuda_memory_log_interval", 1)))
+    return curr_iter < 3 or curr_iter % interval == 0
+
+
+def _reset_cuda_memory_peak(cfg):
+    if "cuda" in cfg.device and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _log_cuda_memory(cfg, distributed_backend, curr_iter, tag):
+    if not _cuda_memory_enabled(cfg, distributed_backend):
+        return
+    if not _should_log_cuda_memory(cfg, curr_iter):
+        return
+    torch.cuda.synchronize()
+    gib = 1024**3
+    print(
+        f"[mem][iter={curr_iter}][{tag}] "
+        f"curr_alloc_GiB={torch.cuda.memory_allocated() / gib:.3f} "
+        f"curr_resv_GiB={torch.cuda.memory_reserved() / gib:.3f} "
+        f"max_alloc_GiB={torch.cuda.max_memory_allocated() / gib:.3f} "
+        f"max_resv_GiB={torch.cuda.max_memory_reserved() / gib:.3f}",
+        flush=True,
+    )
+
+
 def train(
     model,
     opt,
@@ -195,6 +231,11 @@ def train(
         # Train model
         t_start = time.perf_counter_ns()
         gn_step_size = None
+        if _cuda_memory_enabled(cfg, distributed_backend) and _should_log_cuda_memory(
+            cfg, curr_iter
+        ):
+            _reset_cuda_memory_peak(cfg)
+            _log_cuda_memory(cfg, distributed_backend, curr_iter, "iter_start")
         if use_gn:
             raw_model = distributed_backend.get_raw_model(model)
             gn_mode = "full" if cfg.opt == "gn-full" else "prox"
@@ -284,6 +325,11 @@ def train(
             )
             for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
                 x, y = get_batch(train_reader, device=cfg.device)
+                if (
+                    _cuda_memory_enabled(cfg, distributed_backend)
+                    and _should_log_cuda_memory(cfg, curr_iter)
+                ):
+                    _reset_cuda_memory_peak(cfg)
                 with type_ctx:
                     with distributed_backend.get_context_for_microstep_forward(
                         model=model,
@@ -299,9 +345,26 @@ def train(
                             )
                         else:
                             outputs = model(x, targets=y, moe=cfg.moe)
+                _log_cuda_memory(
+                    cfg,
+                    distributed_backend,
+                    curr_iter,
+                    f"micro={microstep_idx}/after_forward",
+                )
 
                 loss = outputs["loss"] / cfg.acc_steps
+                if (
+                    _cuda_memory_enabled(cfg, distributed_backend)
+                    and _should_log_cuda_memory(cfg, curr_iter)
+                ):
+                    _reset_cuda_memory_peak(cfg)
                 loss.backward()
+                _log_cuda_memory(
+                    cfg,
+                    distributed_backend,
+                    curr_iter,
+                    f"micro={microstep_idx}/after_backward",
+                )
                 substep += 1
 
             if cfg.grad_clip != 0.0:
@@ -317,14 +380,26 @@ def train(
 
             if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
                 opt.train()
+            if _cuda_memory_enabled(cfg, distributed_backend) and _should_log_cuda_memory(
+                cfg, curr_iter
+            ):
+                _reset_cuda_memory_peak(cfg)
             (
                 opt.step()
                 if cfg.opt != "sophiag"
                 else opt.step(bs=cfg.sophia_bs * cfg.sequence_length)
             )
+            _log_cuda_memory(
+                cfg, distributed_backend, curr_iter, "after_step_before_zero_grad"
+            )
             if cfg.scheduler != "none":
                 scheduler.step()
             if cfg.opt == "sophiag":
+                if (
+                    _cuda_memory_enabled(cfg, distributed_backend)
+                    and _should_log_cuda_memory(cfg, curr_iter)
+                ):
+                    _reset_cuda_memory_peak(cfg)
                 opt.zero_grad(set_to_none=True)
                 if curr_iter % cfg.precondition_frequency == cfg.precondition_frequency - 1:
                     sample_again = model(x, targets=y, get_logits=True)
@@ -341,11 +416,24 @@ def train(
                     opt.update_hessian()
                     opt.zero_grad(set_to_none=True)
                     model.zero_grad()
+                _log_cuda_memory(cfg, distributed_backend, curr_iter, "after_zero_grad")
             elif cfg.opt == "mars":
+                if (
+                    _cuda_memory_enabled(cfg, distributed_backend)
+                    and _should_log_cuda_memory(cfg, curr_iter)
+                ):
+                    _reset_cuda_memory_peak(cfg)
                 opt.zero_grad(set_to_none=True)
                 opt.update_last_grad()
+                _log_cuda_memory(cfg, distributed_backend, curr_iter, "after_zero_grad")
             else:
+                if (
+                    _cuda_memory_enabled(cfg, distributed_backend)
+                    and _should_log_cuda_memory(cfg, curr_iter)
+                ):
+                    _reset_cuda_memory_peak(cfg)
                 opt.zero_grad(set_to_none=True)
+                _log_cuda_memory(cfg, distributed_backend, curr_iter, "after_zero_grad")
 
         if cfg.scheduler != "none" and use_gn:
             scheduler.step()

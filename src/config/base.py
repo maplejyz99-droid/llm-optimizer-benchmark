@@ -53,6 +53,8 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--wandb_entity", default=None, type=none_or_str)
     parser.add_argument("--log_parameter_norms", action="store_true")
     parser.add_argument("--norm_order", default=2)
+    parser.add_argument("--log_cuda_memory", action="store_true")
+    parser.add_argument("--cuda_memory_log_interval", default=1, type=int)
     # Notifications (email/webhook/stdout)
     parser.add_argument("--notify_interval", default=0, type=int)
     parser.add_argument(
