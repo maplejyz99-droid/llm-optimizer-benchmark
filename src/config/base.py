@@ -50,6 +50,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument(
         "--dynamics_logger_cfg", default="./src/logger/rotational_logger.yaml", type=str
     )
+    parser.add_argument("--log_optimizer_groups", action="store_true")
     parser.add_argument("--wandb_entity", default=None, type=none_or_str)
     parser.add_argument("--log_parameter_norms", action="store_true")
     parser.add_argument("--norm_order", default=2)

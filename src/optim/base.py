@@ -119,6 +119,9 @@ def train(
     last_val_pp = None
     last_val_acc = None
     grad_norms = []
+    wall_clock_start = time.perf_counter()
+    train_step_seconds_total = 0.0
+    completed_iterations = 0
     model.train()
     use_gn = cfg.opt in {"gn-prox", "gn-full"}
 
@@ -360,6 +363,10 @@ def train(
         dt = (time.perf_counter_ns() - t_start) / 1e9
 
         curr_iter += 1
+        completed_iterations += 1
+        train_step_seconds_total += dt
+        elapsed_seconds = time.perf_counter() - wall_clock_start
+        avg_iter_dt = train_step_seconds_total / max(1, completed_iterations)
         last_iter_dt = dt
 
         if (
@@ -384,6 +391,9 @@ def train(
             print(
                 f"Train: Iter={curr_iter} ({epoch:0.3f} epochs) "
                 f"train_loss={train_loss:.3f} iter_dt={dt:.2e}s "
+                f"elapsed={elapsed_seconds:.2f}s "
+                f"train_step_total={train_step_seconds_total:.2f}s "
+                f"avg_iter_dt={avg_iter_dt:.2e}s "
                 f"lr={current_lrs[0]:.2e}"
             )
             if cfg.opt == "prodigy":
@@ -397,6 +407,10 @@ def train(
                     "train/perplexity": 2.71828**train_loss,
                     "lr": current_lrs[0],
                     "iter_dt": dt,
+                    "wall_clock/elapsed_seconds": elapsed_seconds,
+                    "train/step_seconds": dt,
+                    "train/step_seconds_total": train_step_seconds_total,
+                    "train/avg_step_seconds": avg_iter_dt,
                     "max_grad_norm": max(grad_norms).item() if grad_norms else 0,
                     "mean_grad_norm": (
                         torch.tensor(grad_norms).mean().item() if grad_norms else 0
@@ -433,6 +447,14 @@ def train(
                 run_name=exp_dir.name,
             )
 
+    stats["wall_clock_seconds"] = time.perf_counter() - wall_clock_start
+    stats["train_step_seconds_total"] = train_step_seconds_total
+    stats["avg_iter_dt"] = (
+        train_step_seconds_total / completed_iterations
+        if completed_iterations
+        else 0.0
+    )
+    stats["completed_iterations"] = completed_iterations
     return stats
 
 

@@ -39,6 +39,40 @@ from optim.soap import SOAP
 from optim.sophia import SophiaG
 
 
+def get_mup_width_mult(args):
+    return args.n_embd / args.scale_base_model
+
+
+def get_muon_effective_backup_lr(group):
+    return group.get("adamw_lr_ratio", 1.0) * group["lr"]
+
+
+def log_optimizer_groups(opt, param_to_name, label):
+    print(f"\nOptimizer parameter groups ({label}):")
+    for group_idx, group in enumerate(opt.param_groups):
+        lr = group.get("lr")
+        weight_decay = group.get("weight_decay", group.get("adamw_wd"))
+        adamw_lr = (
+            get_muon_effective_backup_lr(group)
+            if "adamw_lr_ratio" in group and lr is not None
+            else group.get("adamw_lr")
+        )
+        print(
+            f"  group {group_idx}: lr={lr}, "
+            f"adamw_backup_lr={adamw_lr}, weight_decay={weight_decay}, "
+            f"num_params={len(group['params'])}"
+        )
+        for param in group["params"]:
+            name = param_to_name.get(id(param), "<unnamed>")
+            branch = "default"
+            if param in opt.state and "use_muon" in opt.state[param]:
+                branch = "muon" if opt.state[param]["use_muon"] else "adamw_backup"
+            print(
+                f"    {branch}: {name} shape={tuple(param.shape)} "
+                f"lr={lr} weight_decay={weight_decay}"
+            )
+
+
 def get_args():
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
@@ -125,6 +159,7 @@ def main(args, parser):
         config=args
     )
     param_name_mapping = {p_name: p for p_name, p in model.named_parameters()}
+    param_to_name = {}
     magma_param_ids = set()
 
     def use_magma_for_param(param_name):
@@ -142,6 +177,7 @@ def main(args, parser):
             for translated_name in translated_p_names:
                 param = param_name_mapping[translated_name]
                 params.append(param)
+                param_to_name[id(param)] = translated_name
                 if use_magma_for_param(translated_name):
                     magma_param_ids.add(id(param))
         g["params"] = params
@@ -225,9 +261,18 @@ def main(args, parser):
             if args.distributed_backend is None
             else list(model.module.parameters())
         )
+        muon_lr = args.muon_lr_factor
+        if args.model == "mup_llama":
+            muon_lr = args.muon_lr_factor / get_mup_width_mult(args)
+            print(
+                "muP Llama Muon mode: scaling Muon matrix lr "
+                f"from {args.muon_lr_factor} to {muon_lr}. "
+                "AdamW backup lr remains args.lr; this is an engineering "
+                "training policy, not a theoretical muP-Muon proof."
+            )
         opt = Muon(
             muon_params=param_list,
-            lr=args.muon_lr_factor,
+            lr=muon_lr,
             momentum=args.momentum,
             nesterov=args.nesterov,
             ns_steps=args.muon_ns_steps,
@@ -467,6 +512,8 @@ def main(args, parser):
             nesterov=args.nesterov,
         )
     print(f"\nOptimizer:\n{opt}")
+    if args.log_optimizer_groups:
+        log_optimizer_groups(opt, param_to_name, "before scheduler")
     if "magma" in args.opt:
         print(
             "Magma targets: "
@@ -531,6 +578,8 @@ def main(args, parser):
             raise NotImplementedError(f"Unknown scheduler type: {args.scheduler}.")
     else:
         scheduler = None
+    if args.log_optimizer_groups:
+        log_optimizer_groups(opt, param_to_name, "after scheduler init")
 
     if (exp_dir / "ckpts" / "latest" / "main.pt").exists():
         if not args.auto_resume:
@@ -633,6 +682,7 @@ def get_exp_name(
         "log_interval",
         "log_parameter_norms",
         "log_dynamics",
+        "log_optimizer_groups",
         "dynamics_logger_cfg",
         "experiment_name",
     ],
