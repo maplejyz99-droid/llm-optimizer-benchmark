@@ -209,20 +209,15 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# local artifacts
-exps/
-logs/
+# local artifacts and remote runtime state
+exps
+logs
+src/data/datasets
+wandb/
+.vscode/
 nohup.out
 env_llmopt310.yml
 pip_freeze_llmopt310.txt
 optimizer_curves_*.png
-src/data/datasets/
-
-# local artifacts
-exps/
-logs/
-nohup.out
-env_llmopt310.yml
-pip_freeze_llmopt310.txt
-optimizer_curves_*.png
-src/data/datasets/
+llmopt.bundle
+*.inetloc
