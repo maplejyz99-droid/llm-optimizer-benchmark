@@ -35,7 +35,9 @@ class DataParallelDistributedBackend(DistributedBackend):
         return args
 
     def transform_model(self, model):
-        return DDP(model, device_ids=[self.local_rank])
+        # Llama carries opt-specific Newton-Muon stats buffers; ordinary DDP train/eval
+        # does not need to broadcast them on every forward.
+        return DDP(model, device_ids=[self.local_rank], broadcast_buffers=False)
 
     @contextmanager
     def get_context_for_microstep_forward(
