@@ -120,6 +120,7 @@ class TorchSmokeTest(unittest.TestCase):
             results_base_folder="",
             wandb=False,
             log_interval=0,
+            notify_interval=0,
             log_parameter_norms=False,
             norm_order=2,
             eval_seq_prefix="none",
