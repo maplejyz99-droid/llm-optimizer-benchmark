@@ -39,12 +39,399 @@ from optim.soap import SOAP
 from optim.sophia import SophiaG
 
 
+MUON_SCHEDULER_OPTS = {"muon", "muon-magma", "newton-muon"}
+
+
 def get_mup_width_mult(args):
     return args.n_embd / args.scale_base_model
 
 
 def get_muon_effective_backup_lr(group):
     return group.get("adamw_lr_ratio", 1.0) * group["lr"]
+
+
+def get_optimizer_param_list(args, model):
+    if args.opt == "newton-muon":
+        return list(model.parameters())
+    return (
+        list(model.parameters())
+        if args.distributed_backend is None
+        else list(model.module.parameters())
+    )
+
+
+def build_adamw_optimizer(args, group_specs, lr, betas, weight_decay, fused_label):
+    device_type = "cuda" if "cuda" in args.device else "cpu"
+    use_fused = (device_type == "cuda") and (
+        "fused" in inspect.signature(torch.optim.AdamW).parameters
+    )
+    print(f"using fused {fused_label}: {use_fused}")
+    extra_args = dict(fused=True) if use_fused else dict()
+    return torch.optim.AdamW(
+        group_specs,
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+        **extra_args,
+    )
+
+
+def build_optimizer(args, model, group_specs, magma_param_ids):
+    if args.opt == "adamw":
+        return build_adamw_optimizer(
+            args,
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            fused_label="AdamW",
+        )
+    elif args.opt == "gn-prox" or args.opt == "gn-full":
+        return build_adamw_optimizer(
+            args,
+            group_specs,
+            lr=args.gn_inner_lr,
+            betas=(args.gn_inner_b1, args.gn_inner_b2),
+            # Proximal regularization is applied explicitly in the GN objective.
+            weight_decay=0.0,
+            fused_label="GN inner AdamW",
+        )
+    elif args.opt == "cadamw":
+        return CAdamW(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            eps=1e-8,
+            cautious_xi=args.cautious_xi,
+        )
+    elif args.opt == "soap":
+        return SOAP(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            shampoo_beta=args.shampoo_beta,
+            weight_decay=args.weight_decay,
+            precondition_frequency=args.precondition_frequency,
+            max_precond_dim=args.max_precond_dim,
+            merge_dims=args.merge_dims,
+            precondition_1d=args.precondition_1d,
+            normalize_grads=args.normalize_grads,
+            data_format=args.soap_data_format,
+            correct_bias=args.correct_bias,
+        )
+    elif args.opt == "muon":
+        param_list = get_optimizer_param_list(args, model)
+        muon_lr = args.muon_lr_factor
+        if args.model == "mup_llama":
+            muon_lr = args.muon_lr_factor / get_mup_width_mult(args)
+            print(
+                "muP Llama Muon mode: scaling Muon matrix lr "
+                f"from {args.muon_lr_factor} to {muon_lr}. "
+                "AdamW backup lr remains args.lr; this is an engineering "
+                "training policy, not a theoretical muP-Muon proof."
+            )
+        return Muon(
+            muon_params=param_list,
+            lr=muon_lr,
+            momentum=args.momentum,
+            nesterov=args.nesterov,
+            ns_steps=args.muon_ns_steps,
+            adamw_params=None,
+            adamw_lr=args.lr,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            adamw_wd=args.weight_decay,
+        )
+    elif args.opt == "newton-muon":
+        param_list = get_optimizer_param_list(args, model)
+        opt = NewtonMuon(
+            muon_params=param_list,
+            lr=args.muon_lr_factor,
+            momentum=args.momentum,
+            nesterov=args.nesterov,
+            ns_steps=args.muon_ns_steps,
+            adamw_params=None,
+            adamw_lr=args.lr,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            adamw_wd=args.weight_decay,
+            precond_every=args.newton_muon_precond_every,
+            precond_ewma=args.newton_muon_precond_ewma,
+            precond_init_diag=args.newton_muon_precond_init_diag,
+            precond_ridge_mult=args.newton_muon_precond_ridge_mult,
+            precond_eps=args.newton_muon_precond_eps,
+        )
+        opt.attach_preconditioner(model)
+        return opt
+    elif args.opt == "muon-magma":
+        param_list = get_optimizer_param_list(args, model)
+        return MagmaMuon(
+            muon_params=param_list,
+            lr=args.muon_lr_factor,
+            momentum=args.momentum,
+            nesterov=args.nesterov,
+            ns_steps=args.muon_ns_steps,
+            adamw_params=None,
+            adamw_lr=args.lr,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            adamw_wd=args.weight_decay,
+            magma_survival_p=args.magma_survival_p,
+            magma_tau=args.magma_tau,
+            magma_beta=args.magma_beta,
+            magma_param_ids=magma_param_ids,
+        )
+    elif args.opt == "adamw-magma":
+        return MagmaAdamW(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            eps=1e-8,
+            magma_survival_p=args.magma_survival_p,
+            magma_tau=args.magma_tau,
+            magma_beta=args.magma_beta,
+            magma_param_ids=magma_param_ids,
+        )
+    elif args.opt == "d-muon":
+        return DistributedMuon(
+            group_specs,
+            lr=args.lr,
+            momentum=args.momentum,
+            nesterov=args.nesterov,
+            ns_steps=args.muon_ns_steps,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            weight_decay=args.weight_decay,
+        )
+    elif args.opt == "ademamix":
+        return AdEMAMix(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2, args.adema_beta3),
+            alpha=args.adema_alpha,
+            beta3_warmup=args.adema_beta3_warmup,
+            alpha_warmup=args.adema_alpha_warmup,
+            weight_decay=args.weight_decay,
+        )
+    elif args.opt == "lion":
+        return Lion(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+        )
+    elif args.opt == "sf-adamw":
+        return AdamWScheduleFree(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
+            r=args.schedulefree_r,
+            weight_lr_power=args.weight_lr_power,
+        )  # without foreach argument
+    elif args.opt == "sf-sgd":
+        return SGDScheduleFree(
+            group_specs,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
+            r=args.schedulefree_r,
+            weight_lr_power=args.weight_lr_power,
+        )  # without foreach argument
+    elif args.opt == "signsgd":
+        return Signum(
+            group_specs,
+            lr=args.lr,
+            momentum=0.0,  # always use zero momentum because its signSGD
+            dampening=args.dampening,
+            weight_decay=args.weight_decay,
+            nesterov=args.nesterov,
+            sign_update=True,
+        )
+    elif args.opt == "signum":
+        return Signum(
+            group_specs,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            dampening=args.dampening,
+            nesterov=args.nesterov,
+            sign_update=True,
+        )
+    elif args.opt == "prodigy":
+        return Prodigy(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            beta3=args.prodigy_beta3,
+            weight_decay=args.weight_decay,
+            decouple=args.prodigy_decouple,
+            use_bias_correction=args.prodigy_use_bias_correction,
+            safeguard_warmup=args.prodigy_safeguard_warmup,
+            fsdp_in_use=args.prodigy_fsdp_in_use,
+        )
+    elif args.opt == "sophiag":
+        return SophiaG(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            rho=args.sophia_rho,
+        )
+    elif args.opt == "adopt":
+        return ADOPT(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            eps=args.adopt_eps,  # 1e-6
+            weight_decay=args.weight_decay,
+            decouple=args.adopt_decouple,
+        )
+    elif args.opt == "mars":
+        return MARS(
+            group_specs,
+            lr=args.mars_lr,
+            betas=(args.mars_beta1, args.mars_beta2),
+            weight_decay=args.weight_decay,
+            amsgrad=False,
+            gamma=args.mars_vr_gamma,
+            is_approx=args.mars_is_approx,
+            mars_type=args.mars_type,
+            optimize_1d=False,  # we set in order to optimize 1D parameters with AdamW
+            lr_1d=args.lr,  # AdamW's lr when optimize_1d=False
+            betas_1d=(args.beta1, args.beta2),  # AdamW's betas when optimize_1d=False
+            weight_decay_1d=0.1,  # AdamW's weight decay
+        )
+    elif args.opt == "adafactor":
+        return Adafactor(
+            group_specs,
+            lr=args.lr,
+            decay_rate=args.adafactor_decay_rate,
+            beta1=args.beta1,
+            clip_threshold=1.0,
+            weight_decay=args.weight_decay,
+        )
+    elif args.opt == "lamb":
+        return Lamb(
+            group_specs,
+            lr=args.lr,
+            betas=(args.beta1, args.beta2),
+            weight_decay=args.weight_decay,
+            adam=False,
+            bias_correction=args.lamb_use_bias_correction,
+        )
+    elif args.opt == "scion":
+        scion_param_groups = scion_partitions(group_specs, model, args)
+        scion_params_cnt = sum(
+            p.numel() for group in scion_param_groups for p in group["params"]
+        )
+        print(f"Optimized parameters: {scion_params_cnt}")
+        return Scion(
+            scion_param_groups,
+            lr=args.lr,
+            momentum=args.momentum,
+        )
+    elif args.opt == "scion-light":
+        scion_param_groups = scion_partitions(group_specs, model, args)
+        scion_params_cnt = sum(
+            p.numel() for group in scion_param_groups for p in group["params"]
+        )
+        print(f"Optimized parameters: {scion_params_cnt}")
+        return ScionLight(
+            scion_param_groups,
+            lr=args.lr,
+            momentum=args.momentum,
+        )
+    elif args.opt == "muon-pytorch":
+        return torch.optim.Muon(
+            group_specs,
+            lr=args.lr,
+            momentum=args.momentum,
+            nesterov=args.nesterov,
+            ns_steps=args.muon_ns_steps,
+            ns_coefficients=(
+                3.4445,
+                -4.775,
+                2.0315,
+            ),  # someone might try to change it later
+            eps=1e-7,  # muon pytorch uses smaller eps
+            adjust_lr_fn=None,  # to make the orthogonalized update have a consistent RMS across rectangular matrices
+        )
+    else:
+        return torch.optim.SGD(
+            group_specs,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            nesterov=args.nesterov,
+        )
+
+
+def uses_combined_scheduler(args):
+    return args.opt in MUON_SCHEDULER_OPTS
+
+
+def build_scheduler(args, opt, group_specs):
+    if args.scheduler == "none":
+        return None
+
+    assert (
+        args.warmup_steps < args.iterations
+    ), "Warmup steps must be < iterations."  # from schedules-and-scaling
+    sched_base_lr = args.gn_inner_lr if args.opt in {"gn-prox", "gn-full"} else args.lr
+    if args.scheduler in ["cos", "linear"]:
+        # initial lr is args.lr / div_factor
+        # final lr is initial_lr/final_div_factor = args.lr / div_factor / final_div_factor
+        return (
+            torch.optim.lr_scheduler.OneCycleLR(
+                optimizer=opt,
+                max_lr=[
+                    group.get("lr", sched_base_lr) for group in group_specs
+                ],  # it was args.lr
+                total_steps=args.iterations,
+                pct_start=args.warmup_steps
+                / args.iterations,  # it was args.warmup_percent
+                anneal_strategy=args.scheduler,
+                cycle_momentum=False,
+                div_factor=1e2,
+                final_div_factor=args.final_div_factor,
+            )
+            if not uses_combined_scheduler(args)
+            else CombinedScheduler(opt, args)
+        )
+    elif args.scheduler == "cos_inf":
+        lambda_schedule = cos_inf_schedule(
+            n_iterations=args.iterations,
+            n_warmup=args.warmup_steps,
+            n_inf=args.cos_inf_steps,
+            div_factor=1e2,
+            final_div_factor=0.1,
+        )
+        return (
+            torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
+            if not uses_combined_scheduler(args)
+            else CombinedScheduler(opt, args)
+        )
+    elif args.scheduler == "wsd":
+        lambda_schedule = wsd_schedule(
+            n_iterations=args.iterations,
+            n_warmup=args.warmup_steps,
+            fract_decay=args.wsd_fract_decay,
+            init_div_factor=1e2,
+            final_lr_factor=args.wsd_final_lr_scale,  # should be 0 here
+            decay_type=args.decay_type,
+        )
+        return (
+            torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
+            if not uses_combined_scheduler(args)
+            else CombinedScheduler(opt, args)
+        )
+    else:
+        raise NotImplementedError(f"Unknown scheduler type: {args.scheduler}.")
 
 
 def log_optimizer_groups(opt, param_to_name, label):
@@ -202,315 +589,7 @@ def main(args, parser):
 
     args.world_size = distributed_backend.get_world_size()
 
-    if args.opt == "adamw":
-        device_type = "cuda" if "cuda" in args.device else "cpu"
-        use_fused = (device_type == "cuda") and (
-            "fused" in inspect.signature(torch.optim.AdamW).parameters
-        )
-        print(f"using fused AdamW: {use_fused}")
-        extra_args = dict(fused=True) if use_fused else dict()
-        opt = torch.optim.AdamW(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-            **extra_args,
-        )
-    elif args.opt == "gn-prox" or args.opt == "gn-full":
-        device_type = "cuda" if "cuda" in args.device else "cpu"
-        use_fused = (device_type == "cuda") and (
-            "fused" in inspect.signature(torch.optim.AdamW).parameters
-        )
-        print(f"using fused GN inner AdamW: {use_fused}")
-        extra_args = dict(fused=True) if use_fused else dict()
-        opt = torch.optim.AdamW(
-            group_specs,
-            lr=args.gn_inner_lr,
-            betas=(args.gn_inner_b1, args.gn_inner_b2),
-            # Proximal regularization is applied explicitly in the GN objective.
-            weight_decay=0.0,
-            **extra_args,
-        )
-    elif args.opt == "cadamw":
-        opt = CAdamW(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-            eps=1e-8,
-            cautious_xi=args.cautious_xi,
-        )
-    elif args.opt == "soap":
-        opt = SOAP(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            shampoo_beta=args.shampoo_beta,
-            weight_decay=args.weight_decay,
-            precondition_frequency=args.precondition_frequency,
-            max_precond_dim=args.max_precond_dim,
-            merge_dims=args.merge_dims,
-            precondition_1d=args.precondition_1d,
-            normalize_grads=args.normalize_grads,
-            data_format=args.soap_data_format,
-            correct_bias=args.correct_bias,
-        )
-    elif args.opt == "muon":
-        param_list = (
-            list(model.parameters())
-            if args.distributed_backend is None
-            else list(model.module.parameters())
-        )
-        muon_lr = args.muon_lr_factor
-        if args.model == "mup_llama":
-            muon_lr = args.muon_lr_factor / get_mup_width_mult(args)
-            print(
-                "muP Llama Muon mode: scaling Muon matrix lr "
-                f"from {args.muon_lr_factor} to {muon_lr}. "
-                "AdamW backup lr remains args.lr; this is an engineering "
-                "training policy, not a theoretical muP-Muon proof."
-            )
-        opt = Muon(
-            muon_params=param_list,
-            lr=muon_lr,
-            momentum=args.momentum,
-            nesterov=args.nesterov,
-            ns_steps=args.muon_ns_steps,
-            adamw_params=None,
-            adamw_lr=args.lr,
-            adamw_betas=(args.beta1, args.beta2),
-            adamw_eps=1e-8,
-            adamw_wd=args.weight_decay,
-        )
-    elif args.opt == "newton-muon":
-        param_list = list(model.parameters())
-        opt = NewtonMuon(
-            muon_params=param_list,
-            lr=args.muon_lr_factor,
-            momentum=args.momentum,
-            nesterov=args.nesterov,
-            ns_steps=args.muon_ns_steps,
-            adamw_params=None,
-            adamw_lr=args.lr,
-            adamw_betas=(args.beta1, args.beta2),
-            adamw_eps=1e-8,
-            adamw_wd=args.weight_decay,
-            precond_every=args.newton_muon_precond_every,
-            precond_ewma=args.newton_muon_precond_ewma,
-            precond_init_diag=args.newton_muon_precond_init_diag,
-            precond_ridge_mult=args.newton_muon_precond_ridge_mult,
-            precond_eps=args.newton_muon_precond_eps,
-        )
-        opt.attach_preconditioner(model)
-    elif args.opt == "muon-magma":
-        param_list = (
-            list(model.parameters())
-            if args.distributed_backend is None
-            else list(model.module.parameters())
-        )
-        opt = MagmaMuon(
-            muon_params=param_list,
-            lr=args.muon_lr_factor,
-            momentum=args.momentum,
-            nesterov=args.nesterov,
-            ns_steps=args.muon_ns_steps,
-            adamw_params=None,
-            adamw_lr=args.lr,
-            adamw_betas=(args.beta1, args.beta2),
-            adamw_eps=1e-8,
-            adamw_wd=args.weight_decay,
-            magma_survival_p=args.magma_survival_p,
-            magma_tau=args.magma_tau,
-            magma_beta=args.magma_beta,
-            magma_param_ids=magma_param_ids,
-        )
-    elif args.opt == "adamw-magma":
-        opt = MagmaAdamW(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-            eps=1e-8,
-            magma_survival_p=args.magma_survival_p,
-            magma_tau=args.magma_tau,
-            magma_beta=args.magma_beta,
-            magma_param_ids=magma_param_ids,
-        )
-    elif args.opt == "d-muon":
-        opt = DistributedMuon(
-            group_specs,
-            lr=args.lr,
-            momentum=args.momentum,
-            nesterov=args.nesterov,
-            ns_steps=args.muon_ns_steps,
-            adamw_betas=(args.beta1, args.beta2),
-            adamw_eps=1e-8,
-            weight_decay=args.weight_decay,
-        )
-    elif args.opt == "ademamix":
-        opt = AdEMAMix(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2, args.adema_beta3),
-            alpha=args.adema_alpha,
-            beta3_warmup=args.adema_beta3_warmup,
-            alpha_warmup=args.adema_alpha_warmup,
-            weight_decay=args.weight_decay,
-        )
-    elif args.opt == "lion":
-        opt = Lion(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-        )
-    elif args.opt == "sf-adamw":
-        opt = AdamWScheduleFree(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-            warmup_steps=args.warmup_steps,
-            r=args.schedulefree_r,
-            weight_lr_power=args.weight_lr_power,
-        )  # without foreach argument
-    elif args.opt == "sf-sgd":
-        opt = SGDScheduleFree(
-            group_specs,
-            lr=args.lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-            warmup_steps=args.warmup_steps,
-            r=args.schedulefree_r,
-            weight_lr_power=args.weight_lr_power,
-        )  # without foreach argument
-    elif args.opt == "signsgd":
-        opt = Signum(
-            group_specs,
-            lr=args.lr,
-            momentum=0.0,  # always use zero momentum because its signSGD
-            dampening=args.dampening,
-            weight_decay=args.weight_decay,
-            nesterov=args.nesterov,
-            sign_update=True,
-        )
-    elif args.opt == "signum":
-        opt = Signum(
-            group_specs,
-            lr=args.lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-            dampening=args.dampening,
-            nesterov=args.nesterov,
-            sign_update=True,
-        )
-    elif args.opt == "prodigy":
-        opt = Prodigy(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            beta3=args.prodigy_beta3,
-            weight_decay=args.weight_decay,
-            decouple=args.prodigy_decouple,
-            use_bias_correction=args.prodigy_use_bias_correction,
-            safeguard_warmup=args.prodigy_safeguard_warmup,
-            fsdp_in_use=args.prodigy_fsdp_in_use,
-        )
-    elif args.opt == "sophiag":
-        opt = SophiaG(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-            rho=args.sophia_rho,
-        )
-    elif args.opt == "adopt":
-        opt = ADOPT(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            eps=args.adopt_eps,  # 1e-6
-            weight_decay=args.weight_decay,
-            decouple=args.adopt_decouple,
-        )
-    elif args.opt == "mars":
-        opt = MARS(
-            group_specs,
-            lr=args.mars_lr,
-            betas=(args.mars_beta1, args.mars_beta2),
-            weight_decay=args.weight_decay,
-            amsgrad=False,
-            gamma=args.mars_vr_gamma,
-            is_approx=args.mars_is_approx,
-            mars_type=args.mars_type,
-            optimize_1d=False,  # we set in order to optimize 1D parameters with AdamW
-            lr_1d=args.lr,  # AdamW's lr when optimize_1d=False
-            betas_1d=(args.beta1, args.beta2),  # AdamW's betas when optimize_1d=False
-            weight_decay_1d=0.1,  # AdamW's weight decay
-        )
-    elif args.opt == "adafactor":
-        opt = Adafactor(
-            group_specs,
-            lr=args.lr,
-            decay_rate=args.adafactor_decay_rate,
-            beta1=args.beta1,
-            clip_threshold=1.0,
-            weight_decay=args.weight_decay,
-        )
-    elif args.opt == "lamb":
-        opt = Lamb(
-            group_specs,
-            lr=args.lr,
-            betas=(args.beta1, args.beta2),
-            weight_decay=args.weight_decay,
-            adam=False,
-            bias_correction=args.lamb_use_bias_correction,
-        )
-    elif args.opt == "scion":
-        scion_param_groups = scion_partitions(group_specs, model, args)
-        scion_params_cnt = sum(
-            p.numel() for group in scion_param_groups for p in group["params"]
-        )
-        print(f"Optimized parameters: {scion_params_cnt}")
-        opt = Scion(
-            scion_param_groups,
-            lr=args.lr,
-            momentum=args.momentum,
-        )
-    elif args.opt == "scion-light":
-        scion_param_groups = scion_partitions(group_specs, model, args)
-        scion_params_cnt = sum(
-            p.numel() for group in scion_param_groups for p in group["params"]
-        )
-        print(f"Optimized parameters: {scion_params_cnt}")
-        opt = ScionLight(
-            scion_param_groups,
-            lr=args.lr,
-            momentum=args.momentum,
-        )
-    elif args.opt == "muon-pytorch":
-        opt = torch.optim.Muon(
-            group_specs,
-            lr=args.lr,
-            momentum=args.momentum,
-            nesterov=args.nesterov,
-            ns_steps=args.muon_ns_steps,
-            ns_coefficients=(
-                3.4445,
-                -4.775,
-                2.0315,
-            ),  # someone might try to change it later
-            eps=1e-7,  # muon pytorch uses smaller eps
-            adjust_lr_fn=None,  # to make the orthogonalized update have a consistent RMS across rectangular matrices
-        )
-    else:
-        opt = torch.optim.SGD(
-            group_specs,
-            lr=args.lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-            nesterov=args.nesterov,
-        )
+    opt = build_optimizer(args, model, group_specs, magma_param_ids)
     print(f"\nOptimizer:\n{opt}")
     if args.log_optimizer_groups:
         log_optimizer_groups(opt, param_to_name, "before scheduler")
@@ -522,62 +601,7 @@ def main(args, parser):
             f"tau={args.magma_tau}, beta={args.magma_beta})"
         )
 
-    if args.scheduler != "none":
-        assert (
-            args.warmup_steps < args.iterations
-        ), "Warmup steps must be < iterations."  # from schedules-and-scaling
-        sched_base_lr = args.gn_inner_lr if args.opt in {"gn-prox", "gn-full"} else args.lr
-        if args.scheduler in ["cos", "linear"]:
-            # initial lr is args.lr / div_factor
-            # final lr is initial_lr/final_div_factor = args.lr / div_factor / final_div_factor
-            scheduler = (
-                torch.optim.lr_scheduler.OneCycleLR(
-                    optimizer=opt,
-                    max_lr=[
-                        group.get("lr", sched_base_lr) for group in group_specs
-                    ],  # it was args.lr
-                    total_steps=args.iterations,
-                    pct_start=args.warmup_steps
-                    / args.iterations,  # it was args.warmup_percent
-                    anneal_strategy=args.scheduler,
-                    cycle_momentum=False,
-                    div_factor=1e2,
-                    final_div_factor=args.final_div_factor,
-                )
-                if args.opt not in {"muon", "muon-magma", "newton-muon"}
-                else CombinedScheduler(opt, args)
-            )
-        elif args.scheduler == "cos_inf":
-            lambda_schedule = cos_inf_schedule(
-                n_iterations=args.iterations,
-                n_warmup=args.warmup_steps,
-                n_inf=args.cos_inf_steps,
-                div_factor=1e2,
-                final_div_factor=0.1,
-            )
-            scheduler = (
-                torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
-                if args.opt not in {"muon", "muon-magma", "newton-muon"}
-                else CombinedScheduler(opt, args)
-            )
-        elif args.scheduler == "wsd":
-            lambda_schedule = wsd_schedule(
-                n_iterations=args.iterations,
-                n_warmup=args.warmup_steps,
-                fract_decay=args.wsd_fract_decay,
-                init_div_factor=1e2,
-                final_lr_factor=args.wsd_final_lr_scale,  # should be 0 here
-                decay_type=args.decay_type,
-            )
-            scheduler = (
-                torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
-                if args.opt not in {"muon", "muon-magma", "newton-muon"}
-                else CombinedScheduler(opt, args)
-            )
-        else:
-            raise NotImplementedError(f"Unknown scheduler type: {args.scheduler}.")
-    else:
-        scheduler = None
+    scheduler = build_scheduler(args, opt, group_specs)
     if args.log_optimizer_groups:
         log_optimizer_groups(opt, param_to_name, "after scheduler init")
 

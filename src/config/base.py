@@ -7,10 +7,7 @@ def none_or_str(value):
     return value
 
 
-def parse_args(base_parser, args, namespace):
-    parser = base_parser
-
-    # General training params
+def register_general_training_args(parser):
     parser.add_argument("--run_prefix", default=None, type=str)
     parser.add_argument("--experiment_name", default=None, type=str)
     parser.add_argument("--seed", default=0, type=int)
@@ -28,7 +25,8 @@ def parse_args(base_parser, args, namespace):
     )
     parser.add_argument("--log_interval", default=50, type=int)
 
-    # Checkpointing
+
+def register_checkpoint_args(parser):
     parser.add_argument("--results_base_folder", default="./exps", type=str)
     parser.add_argument("--permanent_ckpt_interval", default=0, type=int)
     parser.add_argument("--latest_ckpt_interval", default=0, type=int)
@@ -37,7 +35,8 @@ def parse_args(base_parser, args, namespace):
 
     parser.add_argument("--auto_resume", default=True)
 
-    # logging params (WandB)
+
+def register_logging_args(parser):
     parser.add_argument("--wandb", action="store_true")  # whether to use wandb or not
     parser.add_argument("--wandb_project", default="my-project", type=str)
     parser.add_argument(
@@ -54,7 +53,9 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--wandb_entity", default=None, type=none_or_str)
     parser.add_argument("--log_parameter_norms", action="store_true")
     parser.add_argument("--norm_order", default=2)
-    # Notifications (email/webhook/stdout)
+
+
+def register_notification_args(parser):
     parser.add_argument("--notify_interval", default=0, type=int)
     parser.add_argument(
         "--notify_method",
@@ -73,7 +74,8 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--notify_pushplus_template", default=None, type=none_or_str)
     parser.add_argument("--notify_pushplus_url", default=None, type=none_or_str)
 
-    # Schedule
+
+def register_scheduler_args(parser):
     parser.add_argument(
         "--scheduler",
         default="cos",
@@ -97,7 +99,8 @@ def parse_args(base_parser, args, namespace):
         choices=["linear", "cosine", "exp", "miror_cosine", "square", "sqrt"],
     )
 
-    # Optimization
+
+def register_optimizer_choice_args(parser):
     parser.add_argument(
         "--opt",
         default="adamw",
@@ -130,6 +133,9 @@ def parse_args(base_parser, args, namespace):
             "muon-pytorch",  # works only with torch>=2.9
         ],
     )
+
+
+def register_optimizer_common_args(parser):
     parser.add_argument("--batch_size", default=50, type=int)
     parser.add_argument("--acc_steps", default=1, type=int)
     parser.add_argument("--weight_decay", default=1e-1, type=float)
@@ -139,6 +145,9 @@ def parse_args(base_parser, args, namespace):
         "--grad_clip", default=1.0, type=float
     )  # default value is 1.0 in NanoGPT
     parser.add_argument("--momentum", default=0.9, type=float)
+
+
+def register_soap_args(parser):
     parser.add_argument("--shampoo_beta", default=-1.0, type=float)
     parser.add_argument("--precondition_frequency", default=10, type=int)
     parser.add_argument("--max_precond_dim", default=10000, type=int)
@@ -147,6 +156,9 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--normalize_grads", default=False, type=bool)
     parser.add_argument("--soap_data_format", default="channels_first", type=str)
     parser.add_argument("--correct_bias", default=True, type=bool)
+
+
+def register_muon_args(parser):
     parser.add_argument("--nesterov", default=False, type=bool)
     parser.add_argument("--muon_ns_steps", default=5, type=int)
     parser.add_argument("--muon_lr_factor", default=1.0, type=float)
@@ -155,6 +167,9 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--newton_muon_precond_init_diag", default=1e-3, type=float)
     parser.add_argument("--newton_muon_precond_ridge_mult", default=0.2, type=float)
     parser.add_argument("--newton_muon_precond_eps", default=1e-8, type=float)
+
+
+def register_cadamw_magma_args(parser):
     parser.add_argument("--cautious_xi", default=1.0, type=float)
     parser.add_argument("--magma_survival_p", default=0.5, type=float)
     parser.add_argument("--magma_tau", default=2.0, type=float)
@@ -165,13 +180,22 @@ def parse_args(base_parser, args, namespace):
         choices=["all", "attn-mlp"],
         type=str,
     )
+
+
+def register_ademamix_args(parser):
     parser.add_argument("--adema_beta3", default=0.9, type=float)
     parser.add_argument("--adema_alpha", default=2.0, type=float)
     parser.add_argument("--adema_beta3_warmup", default=None, type=int)
     parser.add_argument("--adema_alpha_warmup", default=None, type=int)
+
+
+def register_schedulefree_sign_args(parser):
     parser.add_argument("--schedulefree_r", default=0.0, type=float)
     parser.add_argument("--weight_lr_power", default=2.0, type=float)
     parser.add_argument("--dampening", default=0.0, type=float)
+
+
+def register_prodigy_sophia_args(parser):
     parser.add_argument("--prodigy_beta3", default=None, type=float)
     parser.add_argument("--prodigy_decouple", default=True, type=bool)
     parser.add_argument("--prodigy_use_bias_correction", default=False, type=bool)
@@ -179,10 +203,16 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--prodigy_fsdp_in_use", default=False, type=bool)
     parser.add_argument("--sophia_rho", default=0.04, type=float)
     parser.add_argument("--sophia_bs", default=480, type=int)
+
+
+def register_clipping_args(parser):
     parser.add_argument(
         "--clipping_type", default="no", choices=["no", "local", "elementwise"]
     )
     parser.add_argument("--clip_eta", default=1.0, type=float)
+
+
+def register_mars_args(parser):
     parser.add_argument(
         "--mars_type",
         default="mars-adamw",
@@ -193,13 +223,22 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--mars_lr", default=3e-3, type=float)
     parser.add_argument("--mars_beta1", default=0.95, type=float)
     parser.add_argument("--mars_beta2", default=0.99, type=float)
+
+
+def register_adaptive_optimizer_args(parser):
     parser.add_argument("--adafactor_decay_rate", default=-0.8, type=float)
     parser.add_argument("--lamb_use_bias_correction", default=False, type=bool)
     parser.add_argument("--adopt_decouple", default=True, type=bool)
     parser.add_argument("--adopt_eps", default=1e-6, type=float)
+
+
+def register_scion_args(parser):
     parser.add_argument("--scion_lmh_scale", default=10.0, type=float)
     parser.add_argument("--scion_emb_scale", default=1.0, type=float)
     parser.add_argument("--scion_tr_scale", default=3.0, type=float)
+
+
+def register_gn_args(parser):
     parser.add_argument("--gn_inner_iters", default=8, type=int)
     parser.add_argument("--gn_inner_lr", default=1e-3, type=float)
     parser.add_argument("--gn_inner_b1", default=0.9, type=float)
@@ -208,6 +247,25 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--gn_linesearch", action="store_true")
     parser.add_argument("--gn_ls_range", default=5, type=int)
     parser.add_argument("--gn_log_inner_steps", action="store_true")
+
+
+def register_optimizer_args(parser):
+    register_optimizer_choice_args(parser)
+    register_optimizer_common_args(parser)
+    register_soap_args(parser)
+    register_muon_args(parser)
+    register_cadamw_magma_args(parser)
+    register_ademamix_args(parser)
+    register_schedulefree_sign_args(parser)
+    register_prodigy_sophia_args(parser)
+    register_clipping_args(parser)
+    register_mars_args(parser)
+    register_adaptive_optimizer_args(parser)
+    register_scion_args(parser)
+    register_gn_args(parser)
+
+
+def register_weight_average_args(parser):
     parser.add_argument(
         "--weight_average", action="store_true"
     )  # uniform weight averaging (or SWA)
@@ -255,7 +313,8 @@ def parse_args(base_parser, args, namespace):
         help="Start EWA after warmup steps.",
     )
 
-    # Dataset params
+
+def register_dataset_args(parser):
     parser.add_argument("--datasets_dir", type=str, default="./src/data/datasets/")
     parser.add_argument(
         "--dataset",
@@ -295,7 +354,8 @@ def parse_args(base_parser, args, namespace):
         "--data_in_ram", action="store_true"
     )  # force the data to RAM, mostly useless except for openwebtext2
 
-    # Model params
+
+def register_model_args(parser):
     parser.add_argument(
         "--model",
         default="llama",
@@ -376,5 +436,19 @@ def parse_args(base_parser, args, namespace):
     )  # mup arguments --- the base model width that mup has been configured on
     parser.add_argument("--scale_base_model", default=256, type=int)
     parser.add_argument("--scale_depth", default=1.4, type=float)
+
+
+def parse_args(base_parser, args, namespace):
+    parser = base_parser
+
+    register_general_training_args(parser)
+    register_checkpoint_args(parser)
+    register_logging_args(parser)
+    register_notification_args(parser)
+    register_scheduler_args(parser)
+    register_optimizer_args(parser)
+    register_weight_average_args(parser)
+    register_dataset_args(parser)
+    register_model_args(parser)
 
     return parser.parse_args(args, namespace)

@@ -26,6 +26,279 @@ from .utils import (eval, extend_onecycle_total_steps, get_batch,
                     visualize_routing)
 
 
+def _save_training_checkpoints(
+    model,
+    opt,
+    scheduler,
+    curr_iter,
+    exp_dir,
+    distributed_backend,
+    cfg,
+):
+    # Preserve the existing behavior: checkpoints are considered at iter 0,
+    # at matching intervals, and at the final iteration for latest checkpoints.
+    if cfg.permanent_ckpt_interval > 0:
+        if curr_iter % cfg.permanent_ckpt_interval == 0:
+            ckpt_dir = exp_dir / "ckpts" / str(curr_iter)
+            if distributed_backend.is_master_process():
+                save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir)
+            save_worker_state(ckpt_dir)
+
+    if cfg.latest_ckpt_interval > 0:
+        if curr_iter % cfg.latest_ckpt_interval == 0 or curr_iter == cfg.iterations:
+            ckpt_dir = exp_dir / "ckpts" / "latest"
+            if distributed_backend.is_master_process():
+                save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir)
+            save_worker_state(ckpt_dir)
+
+
+def _is_full_eval(curr_iter, cfg):
+    return curr_iter in cfg.full_eval_at
+
+
+def _should_run_eval(curr_iter, cfg):
+    return (
+        curr_iter % cfg.eval_interval == 0
+        or curr_iter == cfg.iterations
+        or _is_full_eval(curr_iter, cfg)
+    )
+
+
+def _clip_grad_norm(model, cfg):
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return torch.nn.utils.clip_grad_norm_(
+            model.module.parameters(), cfg.grad_clip
+        )
+    return torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+
+
+def _resume_training_state(model, opt, scheduler, cfg):
+    if cfg.resume_from:
+        # This is a full resume including the model weights, optimizer, state
+        # dataloader state, random seed, etc. Not indended for fine tuning or
+        # other scenarios where some of these should change.
+        print(f"\nResuming Training From {cfg.resume_from}")
+        ckpt_dir = Path(cfg.resume_from)
+        curr_iter = load_checkpoint(
+            model,
+            opt,
+            scheduler,
+            ckpt_dir / "main.pt",
+            cfg.device,
+        )
+        load_worker_state(ckpt_dir)
+        extend_onecycle_total_steps(scheduler, cfg.iterations)
+        return curr_iter
+    return 0
+
+
+def _should_log_train_step(curr_iter, cfg, distributed_backend):
+    return (
+        cfg.log_interval
+        and curr_iter % cfg.log_interval == 0
+        and distributed_backend.is_master_process()
+    )
+
+
+def _log_training_step(
+    curr_iter,
+    model,
+    epoch,
+    tokens,
+    loss,
+    outputs,
+    opt,
+    distributed_backend,
+    cfg,
+    dt,
+    elapsed_seconds,
+    train_step_seconds_total,
+    avg_iter_dt,
+    grad_norms,
+    use_gn,
+    gn_step_size,
+):
+    train_loss = loss.detach().cpu().item() * cfg.acc_steps
+    if use_gn:
+        train_loss = loss.detach().cpu().item()
+    last_train_loss = train_loss
+    train_aux_losses = {f"train/{k}": v for k, v in outputs["aux_losses"].items()}
+
+    current_lrs = [param_group["lr"] for param_group in opt.param_groups]
+    last_lr = current_lrs[0]
+
+    if cfg.opt == "prodigy":
+        prodigy_efective_lrs = log_prodigy_lr(opt)
+
+    print(
+        f"Train: Iter={curr_iter} ({epoch:0.3f} epochs) "
+        f"train_loss={train_loss:.3f} iter_dt={dt:.2e}s "
+        f"elapsed={elapsed_seconds:.2f}s "
+        f"train_step_total={train_step_seconds_total:.2f}s "
+        f"avg_iter_dt={avg_iter_dt:.2e}s "
+        f"lr={current_lrs[0]:.2e}"
+    )
+    if cfg.opt == "prodigy":
+        print(f"effective_lr={prodigy_efective_lrs[0]:.2e}")
+
+    if cfg.wandb:
+        wandb_logs = {
+            "tokens": tokens,
+            "iter": curr_iter,
+            "train/loss": train_loss,
+            "train/perplexity": 2.71828**train_loss,
+            "lr": current_lrs[0],
+            "iter_dt": dt,
+            "wall_clock/elapsed_seconds": elapsed_seconds,
+            "train/step_seconds": dt,
+            "train/step_seconds_total": train_step_seconds_total,
+            "train/avg_step_seconds": avg_iter_dt,
+            "max_grad_norm": max(grad_norms).item() if grad_norms else 0,
+            "mean_grad_norm": (
+                torch.tensor(grad_norms).mean().item() if grad_norms else 0
+            ),
+            **train_aux_losses,
+        }
+
+        if cfg.opt == "prodigy":
+            wandb_logs["effective_lr"] = prodigy_efective_lrs[0]
+        if use_gn and gn_step_size is not None:
+            wandb_logs["train/gn_step_size"] = gn_step_size
+
+        if cfg.log_parameter_norms:
+            raw_model = distributed_backend.get_raw_model(model)
+            model_norm = get_parameter_norms(raw_model, order=cfg.norm_order)
+            wandb_logs["model_norm"] = model_norm
+
+        wandb.log(wandb_logs)
+
+    return last_train_loss, last_lr, []
+
+
+def _notify_training_progress(
+    curr_iter,
+    epoch,
+    exp_dir,
+    opt,
+    distributed_backend,
+    cfg,
+    last_train_loss,
+    last_val_loss,
+    last_val_pp,
+    last_val_acc,
+    last_lr,
+    last_iter_dt,
+):
+    if distributed_backend.is_master_process():
+        current_lrs = [param_group["lr"] for param_group in opt.param_groups]
+        maybe_notify(
+            cfg,
+            curr_iter=curr_iter,
+            epoch=epoch,
+            train_loss=last_train_loss,
+            val_loss=last_val_loss,
+            val_pp=last_val_pp,
+            val_acc=last_val_acc,
+            lr=current_lrs[0] if current_lrs else last_lr,
+            iter_dt=last_iter_dt,
+            run_name=exp_dir.name,
+        )
+
+
+def _run_weight_average_evals(
+    curr_iter,
+    not_compiled_model,
+    weight_averager,
+    ewa,
+    val_reader,
+    type_ctx,
+    distributed_backend,
+    cfg,
+):
+    if curr_iter > cfg.wa_interval and cfg.weight_average:
+        eval_wa(
+            curr_iter,
+            not_compiled_model,
+            weight_averager,
+            val_reader,
+            type_ctx,
+            distributed_backend,
+            cfg,
+            full_eval=_is_full_eval(curr_iter, cfg),
+        )
+
+    if cfg.exponential_weight_average:
+        eval_ewa(
+            curr_iter,
+            not_compiled_model,
+            ewa,
+            val_reader,
+            type_ctx,
+            distributed_backend,
+            cfg,
+            full_eval=_is_full_eval(curr_iter, cfg),
+        )
+
+
+def _step_weight_averagers(
+    not_compiled_model,
+    weight_averager,
+    ewa,
+    distributed_backend,
+    cfg,
+):
+    if cfg.weight_average:
+        weight_averager.step(
+            not_compiled_model, distributed_backend.is_master_process()
+        )
+    if cfg.exponential_weight_average:
+        ewa.step(not_compiled_model, distributed_backend.is_master_process())
+
+
+def _run_accumulation_microsteps(
+    model,
+    opt,
+    train_reader,
+    type_ctx,
+    distributed_backend,
+    cfg,
+):
+    has_precond_flag = hasattr(opt, "precond_flag_for_step")
+    precond_flag = opt.precond_flag_for_step() if has_precond_flag else False
+    x = y = outputs = loss = None
+
+    for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
+        x, y = get_batch(train_reader, device=cfg.device)
+        with type_ctx:
+            with distributed_backend.get_context_for_microstep_forward(
+                model=model,
+                microstep_idx=microstep_idx,
+                gradient_accumulation_steps=cfg.acc_steps,
+            ):
+                if has_precond_flag:
+                    outputs = model(
+                        x,
+                        targets=y,
+                        moe=cfg.moe,
+                        precond_flag=precond_flag,
+                    )
+                else:
+                    outputs = model(x, targets=y, moe=cfg.moe)
+
+        loss = outputs["loss"] / cfg.acc_steps
+        loss.backward()
+
+    return x, y, outputs, loss, cfg.acc_steps
+
+
+def _step_standard_optimizer(opt, scheduler, cfg):
+    if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
+        opt.train()
+    opt.step()
+    if cfg.scheduler != "none":
+        scheduler.step()
+
+
 def train(
     model,
     opt,
@@ -52,24 +325,9 @@ def train(
     else:
         type_ctx = nullcontext()
 
-    if cfg.resume_from:
-        # This is a full resume including the model weights, optimizer, state
-        # dataloader state, random seed, etc. Not indended for fine tuning or
-        # other scenarios where some of these should change.
-        print(f"\nResuming Training From {cfg.resume_from}")
-        ckpt_dir = Path(cfg.resume_from)
-        curr_iter = load_checkpoint(
-            model,
-            opt,
-            scheduler,
-            ckpt_dir / "main.pt",
-            cfg.device,
-        )
-        load_worker_state(ckpt_dir)
-        extend_onecycle_total_steps(scheduler, cfg.iterations)
-    else:
-        curr_iter = 0
+    curr_iter = _resume_training_state(model, opt, scheduler, cfg)
 
+    weight_averager = None
     if cfg.weight_average:
         # This does generally not support resuming training, but will work if
         # cfg.wa_interval perfectly divides the iteration number of the chkpt.
@@ -86,6 +344,8 @@ def train(
             }[cfg.wa_dtype],
             count=curr_iter,
         )
+
+    ewa = None
     if cfg.exponential_weight_average:
         ewa = ExponentialWeightAverager(
             not_compiled_model,
@@ -126,30 +386,20 @@ def train(
     use_gn = cfg.opt in {"gn-prox", "gn-full"}
 
     while curr_iter <= cfg.iterations:
-        # Save permanent checkpoint
-        if cfg.permanent_ckpt_interval > 0:
-            if curr_iter % cfg.permanent_ckpt_interval == 0:
-                ckpt_dir = exp_dir / "ckpts" / str(curr_iter)
-                if distributed_backend.is_master_process():
-                    save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir)
-                save_worker_state(ckpt_dir)
-
-        # Save temporary checkpoint for resuming training
-        if cfg.latest_ckpt_interval > 0:
-            if curr_iter % cfg.latest_ckpt_interval == 0 or curr_iter == cfg.iterations:
-                ckpt_dir = exp_dir / "ckpts" / "latest"
-                if distributed_backend.is_master_process():
-                    save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir)
-                save_worker_state(ckpt_dir)
+        _save_training_checkpoints(
+            model,
+            opt,
+            scheduler,
+            curr_iter,
+            exp_dir,
+            distributed_backend,
+            cfg,
+        )
 
         ws = distributed_backend.get_world_size()
         tokens = ws * substep * cfg.sequence_length * cfg.batch_size
         epoch = tokens / train_reader.num_tokens
-        if (
-            curr_iter % cfg.eval_interval == 0
-            or curr_iter == cfg.iterations
-            or (curr_iter in cfg.full_eval_at)
-        ):
+        if _should_run_eval(curr_iter, cfg):
             (
                 last_val_loss,
                 last_val_pp,
@@ -164,32 +414,19 @@ def train(
                 distributed_backend,
                 cfg,
                 opt,
-                full_eval=(curr_iter in cfg.full_eval_at),
+                full_eval=_is_full_eval(curr_iter, cfg),
             )
 
-            if curr_iter > cfg.wa_interval and cfg.weight_average:
-                eval_wa(
-                    curr_iter,
-                    not_compiled_model,
-                    weight_averager,
-                    val_reader,
-                    type_ctx,
-                    distributed_backend,
-                    cfg,
-                    full_eval=(curr_iter in cfg.full_eval_at),
-                )
-
-            if cfg.exponential_weight_average:
-                eval_ewa(
-                    curr_iter,
-                    not_compiled_model,
-                    ewa,
-                    val_reader,
-                    type_ctx,
-                    distributed_backend,
-                    cfg,
-                    full_eval=(curr_iter in cfg.full_eval_at),
-                )
+            _run_weight_average_evals(
+                curr_iter,
+                not_compiled_model,
+                weight_averager,
+                ewa,
+                val_reader,
+                type_ctx,
+                distributed_backend,
+                cfg,
+            )
 
         if curr_iter == cfg.iterations:
             # Save checkpoints and evaluate at final iteration, but no need to train further
@@ -222,14 +459,7 @@ def train(
                     param.grad = grad.detach()
 
                 if cfg.grad_clip != 0.0:
-                    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            model.module.parameters(), cfg.grad_clip
-                        )
-                    else:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), cfg.grad_clip
-                        )
+                    grad_norm = _clip_grad_norm(model, cfg)
                     grad_norms.append(grad_norm)
 
                 opt.step()
@@ -280,53 +510,30 @@ def train(
             }
             grad_norms.append(torch.tensor(gn_metrics.gradient_norm))
         else:
-            precond_flag = (
-                opt.precond_flag_for_step()
-                if hasattr(opt, "precond_flag_for_step")
-                else False
+            x, y, outputs, loss, microsteps_run = _run_accumulation_microsteps(
+                model,
+                opt,
+                train_reader,
+                type_ctx,
+                distributed_backend,
+                cfg,
             )
-            for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
-                x, y = get_batch(train_reader, device=cfg.device)
-                with type_ctx:
-                    with distributed_backend.get_context_for_microstep_forward(
-                        model=model,
-                        microstep_idx=microstep_idx,
-                        gradient_accumulation_steps=cfg.acc_steps,
-                    ):
-                        if hasattr(opt, "precond_flag_for_step"):
-                            outputs = model(
-                                x,
-                                targets=y,
-                                moe=cfg.moe,
-                                precond_flag=precond_flag,
-                            )
-                        else:
-                            outputs = model(x, targets=y, moe=cfg.moe)
-
-                loss = outputs["loss"] / cfg.acc_steps
-                loss.backward()
-                substep += 1
+            substep += microsteps_run
 
             if cfg.grad_clip != 0.0:
-                if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.module.parameters(), cfg.grad_clip
-                    )
-                else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), cfg.grad_clip
-                    )
+                grad_norm = _clip_grad_norm(model, cfg)
                 grad_norms.append(grad_norm)
 
-            if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
-                opt.train()
-            (
-                opt.step()
-                if cfg.opt != "sophiag"
-                else opt.step(bs=cfg.sophia_bs * cfg.sequence_length)
-            )
-            if cfg.scheduler != "none":
-                scheduler.step()
+            if cfg.opt in {"sophiag", "mars"}:
+                (
+                    opt.step()
+                    if cfg.opt != "sophiag"
+                    else opt.step(bs=cfg.sophia_bs * cfg.sequence_length)
+                )
+                if cfg.scheduler != "none":
+                    scheduler.step()
+            else:
+                _step_standard_optimizer(opt, scheduler, cfg)
             if cfg.opt == "sophiag":
                 opt.zero_grad(set_to_none=True)
                 if curr_iter % cfg.precondition_frequency == cfg.precondition_frequency - 1:
@@ -353,12 +560,13 @@ def train(
         if cfg.scheduler != "none" and use_gn:
             scheduler.step()
 
-        if cfg.weight_average:
-            weight_averager.step(
-                not_compiled_model, distributed_backend.is_master_process()
-            )
-        if cfg.exponential_weight_average:
-            ewa.step(not_compiled_model, distributed_backend.is_master_process())
+        _step_weight_averagers(
+            not_compiled_model,
+            weight_averager,
+            ewa,
+            distributed_backend,
+            cfg,
+        )
 
         dt = (time.perf_counter_ns() - t_start) / 1e9
 
@@ -369,83 +577,40 @@ def train(
         avg_iter_dt = train_step_seconds_total / max(1, completed_iterations)
         last_iter_dt = dt
 
-        if (
-            cfg.log_interval
-            and curr_iter % cfg.log_interval == 0
-            and distributed_backend.is_master_process()  # Only log on master rank
-        ):
-            train_loss = loss.detach().cpu().item() * cfg.acc_steps
-            if use_gn:
-                train_loss = loss.detach().cpu().item()
-            last_train_loss = train_loss
-            train_aux_losses = {
-                f"train/{k}": v for k, v in outputs["aux_losses"].items()
-            }
-
-            current_lrs = [param_group["lr"] for param_group in opt.param_groups]
-            last_lr = current_lrs[0]
-
-            if cfg.opt == "prodigy":
-                prodigy_efective_lrs = log_prodigy_lr(opt)
-
-            print(
-                f"Train: Iter={curr_iter} ({epoch:0.3f} epochs) "
-                f"train_loss={train_loss:.3f} iter_dt={dt:.2e}s "
-                f"elapsed={elapsed_seconds:.2f}s "
-                f"train_step_total={train_step_seconds_total:.2f}s "
-                f"avg_iter_dt={avg_iter_dt:.2e}s "
-                f"lr={current_lrs[0]:.2e}"
-            )
-            if cfg.opt == "prodigy":
-                print(f"effective_lr={prodigy_efective_lrs[0]:.2e}")
-
-            if cfg.wandb:
-                wandb_logs = {
-                    "tokens": tokens,
-                    "iter": curr_iter,
-                    "train/loss": train_loss,
-                    "train/perplexity": 2.71828**train_loss,
-                    "lr": current_lrs[0],
-                    "iter_dt": dt,
-                    "wall_clock/elapsed_seconds": elapsed_seconds,
-                    "train/step_seconds": dt,
-                    "train/step_seconds_total": train_step_seconds_total,
-                    "train/avg_step_seconds": avg_iter_dt,
-                    "max_grad_norm": max(grad_norms).item() if grad_norms else 0,
-                    "mean_grad_norm": (
-                        torch.tensor(grad_norms).mean().item() if grad_norms else 0
-                    ),
-                    **train_aux_losses,
-                }
-
-                if cfg.opt == "prodigy":
-                    wandb_logs["effective_lr"] = prodigy_efective_lrs[0]
-                if use_gn and gn_step_size is not None:
-                    wandb_logs["train/gn_step_size"] = gn_step_size
-
-                if cfg.log_parameter_norms:
-                    raw_model = distributed_backend.get_raw_model(model)
-                    model_norm = get_parameter_norms(raw_model, order=cfg.norm_order)
-                    wandb_logs["model_norm"] = model_norm
-
-                wandb.log(wandb_logs)
-
-            grad_norms = []
-
-        if distributed_backend.is_master_process():
-            current_lrs = [param_group["lr"] for param_group in opt.param_groups]
-            maybe_notify(
+        if _should_log_train_step(curr_iter, cfg, distributed_backend):
+            last_train_loss, last_lr, grad_norms = _log_training_step(
+                curr_iter,
+                model,
+                epoch,
+                tokens,
+                loss,
+                outputs,
+                opt,
+                distributed_backend,
                 cfg,
-                curr_iter=curr_iter,
-                epoch=epoch,
-                train_loss=last_train_loss,
-                val_loss=last_val_loss,
-                val_pp=last_val_pp,
-                val_acc=last_val_acc,
-                lr=current_lrs[0] if current_lrs else last_lr,
-                iter_dt=last_iter_dt,
-                run_name=exp_dir.name,
+                dt,
+                elapsed_seconds,
+                train_step_seconds_total,
+                avg_iter_dt,
+                grad_norms,
+                use_gn,
+                gn_step_size,
             )
+
+        _notify_training_progress(
+            curr_iter,
+            epoch,
+            exp_dir,
+            opt,
+            distributed_backend,
+            cfg,
+            last_train_loss,
+            last_val_loss,
+            last_val_pp,
+            last_val_acc,
+            last_lr,
+            last_iter_dt,
+        )
 
     stats["wall_clock_seconds"] = time.perf_counter() - wall_clock_start
     stats["train_step_seconds_total"] = train_step_seconds_total
@@ -456,6 +621,81 @@ def train(
     )
     stats["completed_iterations"] = completed_iterations
     return stats
+
+
+def _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval):
+    if curr_iter == cfg.iterations or full_eval:
+        return val_reader.num_batches()
+    return cfg.eval_batches
+
+
+def _build_eval_logs(
+    tokens,
+    curr_iter,
+    val_loss,
+    val_perplexity,
+    val_acc,
+    val_aux_losses,
+    cfg,
+    full_eval,
+):
+    if curr_iter == cfg.iterations or full_eval:
+        return {
+            "tokens": tokens,
+            "iter": curr_iter,
+            "final-val/loss": val_loss,
+            "final-val/perplexity": val_perplexity,
+            "final-val/acc": val_acc,
+            **val_aux_losses,
+        }
+    return {
+        "tokens": tokens,
+        "iter": curr_iter,
+        "val/loss": val_loss,
+        "val/perplexity": val_perplexity,
+        "val/acc": val_acc,
+        **val_aux_losses,
+    }
+
+
+def _add_router_logs(logs, router_logits, cfg):
+    if cfg.moe and cfg.plot_router_logits:
+        routing_logs = visualize_routing(router_logits, cfg)
+        logs = {**logs, **routing_logs}
+    return logs
+
+
+def _maybe_log_generated_text(
+    curr_iter,
+    val_perplexity,
+    model,
+    distributed_backend,
+    cfg,
+):
+    if cfg.eval_seq_prefix != "none" and (
+        curr_iter % (cfg.eval_interval * 5) == 0 or curr_iter == cfg.iterations
+    ):
+        text_table = wandb.Table(columns=["itr", "val-pp", "text"])
+
+        out_str = distributed_backend.get_raw_model(model).generate_from_string(
+            cfg.eval_seq_prefix,
+            max_new_tokens=40,
+            temperature=0.9,
+            top_k=None,
+        )
+        text_table.add_data(curr_iter, val_perplexity, out_str)
+        # why a copy? see github.com/wandb/wandb/issues/2981
+        wandb.log({f"generated-text-{wandb.run.name}": copy.copy(text_table)})
+
+
+def _enter_eval_mode(model, opt, cfg):
+    model.eval()
+    if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
+        opt.eval()
+
+
+def _restore_train_mode(model):
+    model.train()
 
 
 def eval_and_log(
@@ -474,14 +714,9 @@ def eval_and_log(
         # Only evaluate and log on master rank
         return None, None, None
 
-    model.eval()
-    if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
-        opt.eval()
+    _enter_eval_mode(model, opt, cfg)
 
-    if curr_iter == cfg.iterations or full_eval:
-        max_num_batches = val_reader.num_batches()
-    else:
-        max_num_batches = cfg.eval_batches
+    max_num_batches = _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval)
 
     # to make sure we start from the beginning of the validation set,
     # i.e. repeat the same batches
@@ -505,42 +740,24 @@ def eval_and_log(
     )
 
     if cfg.wandb:
-        if curr_iter == cfg.iterations or full_eval:
-            logs = {
-                "tokens": tokens,
-                "iter": curr_iter,
-                "final-val/loss": val_loss,
-                "final-val/perplexity": val_perplexity,
-                "final-val/acc": val_acc,
-                **val_aux_losses,
-            }
-        else:
-            logs = {
-                "tokens": tokens,
-                "iter": curr_iter,
-                "val/loss": val_loss,
-                "val/perplexity": val_perplexity,
-                "val/acc": val_acc,
-                **val_aux_losses,
-            }
-        if cfg.moe and cfg.plot_router_logits:
-            routing_logs = visualize_routing(router_logits, cfg)
-            logs = {**logs, **routing_logs}
-
+        logs = _build_eval_logs(
+            tokens,
+            curr_iter,
+            val_loss,
+            val_perplexity,
+            val_acc,
+            val_aux_losses,
+            cfg,
+            full_eval,
+        )
+        logs = _add_router_logs(logs, router_logits, cfg)
         wandb.log(logs)
-        if cfg.eval_seq_prefix != "none" and (
-            curr_iter % (cfg.eval_interval * 5) == 0 or curr_iter == cfg.iterations
-        ):
-            text_table = wandb.Table(columns=["itr", "val-pp", "text"])
-
-            out_str = distributed_backend.get_raw_model(model).generate_from_string(
-                cfg.eval_seq_prefix,
-                max_new_tokens=40,
-                temperature=0.9,
-                top_k=None,
-            )
-            text_table.add_data(curr_iter, val_perplexity, out_str)
-            # why a copy? see github.com/wandb/wandb/issues/2981
-            wandb.log({f"generated-text-{wandb.run.name}": copy.copy(text_table)})
-    model.train()
+        _maybe_log_generated_text(
+            curr_iter,
+            val_perplexity,
+            model,
+            distributed_backend,
+            cfg,
+        )
+    _restore_train_mode(model)
     return val_loss, val_perplexity, val_acc
