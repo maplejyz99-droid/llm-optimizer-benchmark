@@ -111,6 +111,7 @@ def parse_args(base_parser, args, namespace):
             "muon",
             "newton-muon",
             "muon-magma",
+            "softeq-k2000-muon",
             "soap",
             "ademamix",
             "lion",

@@ -6,7 +6,7 @@ import torch
 
 try:
     import wandb
-except ImportError:
+except Exception:
     wandb = None
 
 from .utils import eval

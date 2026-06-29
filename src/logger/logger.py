@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 try:
     import wandb
-except ImportError:
+except Exception:
     wandb = None
 
 

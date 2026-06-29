@@ -9,7 +9,7 @@ import yaml
 
 try:
     import wandb
-except ImportError:
+except Exception:
     wandb = None
 
 from logger.logger import DynamicsLogger

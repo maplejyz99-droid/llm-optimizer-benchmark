@@ -143,7 +143,7 @@ parser.add_argument('--beta2', default=0.95, type=float) # adam parameter
 parser.add_argument('--scheduler', default='cos', choices=['linear', 'cos', 'wsd', 'cos_inf', 'none'])
 parser.add_argument('--final_div_factor', default=1, type=float) # cosine and linear schedulers
 parser.add_argument('--cos_inf_steps', default=0, type=int) # cos_inf scheduler
-parser.add_argument('--opt', default='adamw', choices=['adamw', 'sgd', 'muon', 'newton-muon', 'soap', 'ademamix', 'lion', 'sf-adamw', 'sf-sgd', 'signsgd', 'signum', 'prodigy', 'sophiag', 'adopt', 'mars', 'adafactor', 'lamb', 'scion', 'scion-light', 'd-muon', 'muon-pytorch'])
+parser.add_argument('--opt', default='adamw', choices=['adamw', 'gn-prox', 'gn-full', 'cadamw', 'adamw-magma', 'sgd', 'muon', 'newton-muon', 'muon-magma', 'softeq-k2000-muon', 'soap', 'ademamix', 'lion', 'sf-adamw', 'sf-sgd', 'signsgd', 'signum', 'prodigy', 'sophiag', 'adopt', 'mars', 'adafactor', 'lamb', 'scion', 'scion-light', 'd-muon', 'muon-pytorch'])
 parser.add_argument('--eval_freq', default=200, type=int) # in iterations
 parser.add_argument('--results_base_folder', default="./exps", type=str) # where the checkpoints will be saved
 parser.add_argument('--grad_clip', default=0.0, type=float) # default value is 1.0 in nanoGPT
@@ -326,6 +326,11 @@ If do not have access to a GPU or just want to try the code locally on your devi
 ```sh
 python ./src/main.py --n_layer=2 --n_head=4 --n_embd=128 --sequence_length=256 --dataset=shakespeare-char --device=cpu --vocab_size=96
 ```
+
+SoftEq K=2000 Muon is available as `--opt softeq-k2000-muon` for dense
+`llama` / `mup_llama` smoke and benchmark runs. See
+[`docs/softeq-k2000-muon-integration.md`](docs/softeq-k2000-muon-integration.md)
+for implementation scope and GPU validation requirements.
 
 **We believe the details provided are clear enough to reproduce the main findings of our paper.**
 

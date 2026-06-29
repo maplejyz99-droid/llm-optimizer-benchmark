@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 try:
     import wandb
-except ImportError:
+except Exception:
     wandb = None
 
 
