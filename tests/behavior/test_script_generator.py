@@ -44,7 +44,7 @@ class ScriptGeneratorBehaviorTest(unittest.TestCase):
                 capture_output=True,
             )
 
-            self.assertIn("Generated 74 preview scripts", result.stdout)
+            self.assertIn("Generated 75 preview scripts", result.stdout)
             self.assertFalse((output_dir / "scripts/124m/memory-probe-500step.sh").exists())
 
             rendered_count = 0
@@ -64,7 +64,7 @@ class ScriptGeneratorBehaviorTest(unittest.TestCase):
                     parse_base_args(command["argv"])
                     rendered_count += 1
 
-            self.assertEqual(rendered_count, 77)
+            self.assertEqual(rendered_count, 78)
 
     def test_generator_refuses_to_overwrite_authoritative_scripts_dir(self):
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")

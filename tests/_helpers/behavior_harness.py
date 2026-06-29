@@ -171,7 +171,9 @@ class FakeTinyModel:
             {"params": ["block.mlp.weight"], "lr": config.lr * 0.5},
         ]
 
-    def get_num_params(self):
+    def get_num_params(self, non_embedding=True):
+        if non_embedding:
+            return 32
         return sum(param.numel() for _, param in self._params)
 
     def __repr__(self):
@@ -336,6 +338,12 @@ def make_fake_main_replacements(capture):
     newton_module = types.ModuleType("optim.newton_muon")
     newton_module.NewtonMuon = FakeNewtonMuon
 
+    experimental_module = types.ModuleType("optim.experimental")
+    softeq_muon_module = types.ModuleType("optim.experimental.softeq_muon")
+    softeq_muon_module.SoftEqK2000Muon = type(
+        "SoftEqK2000Muon", (FakeMuonOptimizer,), {}
+    )
+
     scion_module = types.ModuleType("optim.scion")
     scion_module.Scion = type("Scion", (FakeOptimizer,), {})
     scion_module.ScionLight = type("ScionLight", (FakeOptimizer,), {})
@@ -372,6 +380,8 @@ def make_fake_main_replacements(capture):
         "optim.scion": scion_module,
         "optim.sign": make_optimizer_module("Signum"),
         "optim.soap": make_optimizer_module("SOAP"),
+        "optim.experimental": experimental_module,
+        "optim.experimental.softeq_muon": softeq_muon_module,
         "optim.sophia": make_optimizer_module("SophiaG"),
     }
 

@@ -1,6 +1,7 @@
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 
 from tests._helpers.behavior_harness import make_args_for_main, load_main_with_fakes
 
@@ -87,6 +88,107 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         self.assertEqual(cfg.n_embd / cfg.scale_base_model, 4.0)
         self.assertEqual(opt.kwargs["lr"], 0.03 / 4.0)
 
+    def test_softeq_k2000_muon_uses_combined_scheduler_and_adamw_backup(self):
+        opt, scheduler, cfg = self._run_main(
+            [
+                "--opt",
+                "softeq-k2000-muon",
+                "--lr",
+                "0.003",
+                "--muon_lr_factor",
+                "0.02",
+                "--momentum",
+                "0.91",
+            ]
+        )
+
+        self.assertEqual(type(opt).__name__, "SoftEqK2000Muon")
+        self.assertEqual(opt.kwargs["lr"], 0.02)
+        self.assertEqual(opt.kwargs["momentum"], 0.91)
+        self.assertEqual(opt.kwargs["weight_decay"], cfg.weight_decay)
+        self.assertEqual(opt.kwargs["adamw_lr"], 0.003)
+        self.assertEqual(opt.kwargs["adamw_betas"], (cfg.beta1, cfg.beta2))
+        self.assertEqual(type(scheduler).__name__, "FakeCombinedScheduler")
+
+    def test_mup_llama_softeq_k2000_muon_scales_matrix_lr_by_width_multiplier(self):
+        opt, _, cfg = self._run_main(
+            [
+                "--model",
+                "mup_llama",
+                "--opt",
+                "softeq-k2000-muon",
+                "--muon_lr_factor",
+                "0.03",
+                "--n_embd",
+                "1024",
+                "--scale_base_model",
+                "256",
+            ]
+        )
+
+        self.assertEqual(type(opt).__name__, "SoftEqK2000Muon")
+        self.assertEqual(cfg.n_embd / cfg.scale_base_model, 4.0)
+        self.assertEqual(opt.kwargs["lr"], 0.03 / 4.0)
+
+    def test_logged_parameter_counts_use_model_contract_for_tied_embeddings(self):
+        main_module = load_main_with_fakes({})
+
+        class TiedLlamaLikeModel:
+            def __init__(self):
+                shared_weight = SimpleNamespace(numel=lambda: 64)
+                self.lm_head = SimpleNamespace(weight=shared_weight)
+                self.transformer = SimpleNamespace(
+                    wte=SimpleNamespace(weight=shared_weight)
+                )
+
+            def get_num_params(self, non_embedding=True):
+                return 100
+
+        params_cnt, nonemb_param_cnt = main_module.get_logged_parameter_counts(
+            TiedLlamaLikeModel()
+        )
+
+        self.assertEqual(params_cnt, 100)
+        self.assertEqual(nonemb_param_cnt, 100)
+
+    def test_log_optimizer_groups_prints_effective_adamw_backup_lr(self):
+        main_module = load_main_with_fakes({})
+
+        class Param:
+            shape = (2, 2)
+
+        muon_param = Param()
+        backup_param = Param()
+        opt = SimpleNamespace(
+            param_groups=[
+                {
+                    "params": [muon_param, backup_param],
+                    "lr": 0.02,
+                    "adamw_lr_ratio": 0.1,
+                    "weight_decay": 0.1,
+                }
+            ],
+            state={
+                muon_param: {"use_muon": True},
+                backup_param: {"use_muon": False},
+            },
+        )
+        output = StringIO()
+
+        with redirect_stdout(output):
+            main_module.log_optimizer_groups(
+                opt,
+                {
+                    id(muon_param): "block.weight",
+                    id(backup_param): "norm.weight",
+                },
+                "test",
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("muon: block.weight shape=(2, 2) lr=0.02", rendered)
+        self.assertIn("adamw_backup: norm.weight shape=(2, 2) lr=0.002", rendered)
+
     def test_newton_muon_attaches_preconditioner_and_uses_combined_scheduler(self):
         opt, scheduler, cfg = self._run_main(
             [
@@ -124,6 +226,26 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         args, parser = make_args_for_main(["--opt", "newton-muon", "--distributed_backend", "nccl"])
 
         with self.assertRaisesRegex(ValueError, "only supports single-device"):
+            with redirect_stdout(StringIO()):
+                main_module.main(args, parser)
+        self.assertNotIn("train_kwargs", capture)
+
+    def test_softeq_k2000_muon_rejects_unsupported_model_before_training(self):
+        capture = {}
+        main_module = load_main_with_fakes(capture)
+        args, parser = make_args_for_main(["--opt", "softeq-k2000-muon", "--model", "base"])
+
+        with self.assertRaisesRegex(ValueError, "only supports --model llama or mup_llama"):
+            with redirect_stdout(StringIO()):
+                main_module.main(args, parser)
+        self.assertNotIn("train_kwargs", capture)
+
+    def test_softeq_k2000_muon_rejects_moe_before_training(self):
+        capture = {}
+        main_module = load_main_with_fakes(capture)
+        args, parser = make_args_for_main(["--opt", "softeq-k2000-muon", "--moe"])
+
+        with self.assertRaisesRegex(ValueError, "does not support MoE"):
             with redirect_stdout(StringIO()):
                 main_module.main(args, parser)
         self.assertNotIn("train_kwargs", capture)
@@ -284,6 +406,8 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
                     [
                         "--opt",
                         opt_name,
+                        "--scheduler",
+                        "none",
                         "--schedulefree_r",
                         "0.04",
                         "--weight_lr_power",
@@ -302,6 +426,16 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
                     self.assertEqual(opt.kwargs["betas"], (cfg.beta1, cfg.beta2))
                 else:
                     self.assertEqual(opt.kwargs["momentum"], cfg.momentum)
+
+    def test_schedulefree_optimizers_reject_external_scheduler(self):
+        capture = {}
+        main_module = load_main_with_fakes(capture)
+        args, parser = make_args_for_main(["--opt", "sf-adamw", "--scheduler", "cos"])
+
+        with self.assertRaisesRegex(ValueError, "require --scheduler none"):
+            with redirect_stdout(StringIO()):
+                main_module.main(args, parser)
+        self.assertNotIn("train_kwargs", capture)
 
     def test_sign_optimizers_keep_momentum_contract(self):
         signsgd_opt, _, signsgd_cfg = self._run_main(
@@ -419,7 +553,7 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
                 self.assertEqual(type(scheduler).__name__, "LambdaLR")
 
     def test_muon_family_uses_combined_scheduler_for_non_none_schedulers(self):
-        for opt_name in ("muon", "muon-magma", "newton-muon"):
+        for opt_name in ("muon", "muon-magma", "newton-muon", "softeq-k2000-muon"):
             for scheduler_name in ("cos", "cos_inf", "wsd"):
                 with self.subTest(opt=opt_name, scheduler=scheduler_name):
                     _, scheduler, _ = self._run_main(

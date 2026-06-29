@@ -37,6 +37,7 @@ class CliArgumentBehaviorTest(unittest.TestCase):
                 "muon",
                 "newton-muon",
                 "muon-magma",
+                "softeq-k2000-muon",
                 "soap",
                 "ademamix",
                 "lion",

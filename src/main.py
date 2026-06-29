@@ -36,10 +36,11 @@ from optim.schedulefree import AdamWScheduleFree, SGDScheduleFree
 from optim.scion import Scion, ScionLight, scion_partitions
 from optim.sign import Signum
 from optim.soap import SOAP
+from optim.experimental.softeq_muon import SoftEqK2000Muon
 from optim.sophia import SophiaG
 
 
-MUON_SCHEDULER_OPTS = {"muon", "muon-magma", "newton-muon"}
+MUON_SCHEDULER_OPTS = {"muon", "muon-magma", "newton-muon", "softeq-k2000-muon"}
 
 
 def get_mup_width_mult(args):
@@ -137,6 +138,28 @@ def build_optimizer(args, model, group_specs, magma_param_ids):
             momentum=args.momentum,
             nesterov=args.nesterov,
             ns_steps=args.muon_ns_steps,
+            adamw_params=None,
+            adamw_lr=args.lr,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            adamw_wd=args.weight_decay,
+        )
+    elif args.opt == "softeq-k2000-muon":
+        param_list = get_optimizer_param_list(args, model)
+        muon_lr = args.muon_lr_factor
+        if args.model == "mup_llama":
+            muon_lr = args.muon_lr_factor / get_mup_width_mult(args)
+            print(
+                "muP Llama SoftEq K=2000 Muon mode: scaling matrix lr "
+                f"from {args.muon_lr_factor} to {muon_lr}. "
+                "AdamW backup lr remains args.lr; this is an engineering "
+                "training policy, not a theoretical muP-Muon proof."
+            )
+        return SoftEqK2000Muon(
+            muon_params=param_list,
+            lr=muon_lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
             adamw_params=None,
             adamw_lr=args.lr,
             adamw_betas=(args.beta1, args.beta2),
@@ -454,10 +477,22 @@ def log_optimizer_groups(opt, param_to_name, label):
             branch = "default"
             if param in opt.state and "use_muon" in opt.state[param]:
                 branch = "muon" if opt.state[param]["use_muon"] else "adamw_backup"
+            effective_lr = adamw_lr if branch == "adamw_backup" and adamw_lr is not None else lr
             print(
                 f"    {branch}: {name} shape={tuple(param.shape)} "
-                f"lr={lr} weight_decay={weight_decay}"
+                f"lr={effective_lr} weight_decay={weight_decay}"
             )
+
+
+def get_logged_parameter_counts(raw_model):
+    params_cnt = raw_model.get_num_params()
+    try:
+        nonemb_param_cnt = raw_model.get_num_params(non_embedding=True)
+    except TypeError:
+        nonemb_param_cnt = params_cnt
+    if nonemb_param_cnt < 0:
+        raise ValueError(f"Non-embedding parameter count is negative: {nonemb_param_cnt}.")
+    return params_cnt, nonemb_param_cnt
 
 
 def get_args():
@@ -488,6 +523,15 @@ def main(args, parser):
             raise ValueError("Newton-Muon v1 does not support MoE models.")
         if args.model != "llama":
             raise ValueError("Newton-Muon v1 only supports --model llama.")
+    if args.opt == "softeq-k2000-muon":
+        if args.moe:
+            raise ValueError("SoftEq K=2000 Muon v1 does not support MoE models.")
+        if args.model not in {"llama", "mup_llama"}:
+            raise ValueError(
+                "SoftEq K=2000 Muon v1 only supports --model llama or mup_llama."
+            )
+    if args.opt in {"sf-adamw", "sf-sgd"} and args.scheduler != "none":
+        raise ValueError("Schedule-free optimizers require --scheduler none.")
     if args.wandb and wandb is None:
         raise ImportError("wandb is not installed; rerun without --wandb or install wandb.")
 
@@ -569,12 +613,8 @@ def main(args, parser):
                     magma_param_ids.add(id(param))
         g["params"] = params
         optimized_params_cnt += sum([p.numel() for p in g["params"]])
-    params_cnt = distributed_backend.get_raw_model(model).get_num_params()
-    nonemb_param_cnt = (
-        params_cnt
-        - distributed_backend.get_raw_model(model).lm_head.weight.numel()
-        - distributed_backend.get_raw_model(model).transformer.wte.weight.numel()
-    )
+    raw_model = distributed_backend.get_raw_model(model)
+    params_cnt, nonemb_param_cnt = get_logged_parameter_counts(raw_model)
     print("number of parameters: %.2fM" % (params_cnt / 1e6,))
     print("number of optimized parameters: %.2fM" % (optimized_params_cnt / 1e6,))
     print("number of non-embedding parameters: %.2fM" % (nonemb_param_cnt / 1e6,))

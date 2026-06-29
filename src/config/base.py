@@ -114,6 +114,7 @@ def register_optimizer_choice_args(parser):
             "muon",
             "newton-muon",
             "muon-magma",
+            "softeq-k2000-muon",
             "soap",
             "ademamix",
             "lion",

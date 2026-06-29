@@ -66,7 +66,7 @@ class ScriptArgumentBehaviorTest(unittest.TestCase):
 
         self.assertEqual(manifest["version"], 1)
         self.assertEqual(manifest_paths, script_paths)
-        self.assertEqual(len(manifest_paths), 75)
+        self.assertEqual(len(manifest_paths), 76)
         self.assertEqual(
             [entry["path"] for entry in manifest["entries"] if entry.get("metadata_only")],
             ["scripts/124m/memory-probe-500step.sh"],
@@ -97,7 +97,7 @@ class ScriptArgumentBehaviorTest(unittest.TestCase):
                 f"manifest drifted from {entry['path']}",
             )
 
-        self.assertEqual(total_commands, 77)
+        self.assertEqual(total_commands, 78)
 
 
 if __name__ == "__main__":

@@ -166,6 +166,20 @@ class OptimizerSpecificCliArgumentBehaviorTest(unittest.TestCase):
         self.assertEqual(args.momentum, 0.88)
         self.assertIs(args.nesterov, True)
 
+    def test_softeq_k2000_muon_specific_arguments_are_parseable(self):
+        args = self.parse(
+            "--opt",
+            "softeq-k2000-muon",
+            "--muon_lr_factor",
+            "0.014",
+            "--momentum",
+            "0.91",
+        )
+
+        self.assertEqual(args.opt, "softeq-k2000-muon")
+        self.assertEqual(args.muon_lr_factor, 0.014)
+        self.assertEqual(args.momentum, 0.91)
+
     def test_newton_muon_preconditioner_arguments_are_parseable(self):
         args = self.parse(
             "--opt",

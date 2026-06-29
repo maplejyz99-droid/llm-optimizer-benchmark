@@ -55,7 +55,7 @@ EXPECTED_PARSER_CONTRACTS = [
     (("--wsd_final_lr_scale",), "wsd_final_lr_scale", "_StoreAction", 0.0, "float", None, None, False),
     (("--wsd_fract_decay",), "wsd_fract_decay", "_StoreAction", 0.1, "float", None, None, False),
     (("--decay_type",), "decay_type", "_StoreAction", "linear", None, ("linear", "cosine", "exp", "miror_cosine", "square", "sqrt"), None, False),
-    (("--opt",), "opt", "_StoreAction", "adamw", None, ("adamw", "gn-prox", "gn-full", "cadamw", "adamw-magma", "sgd", "muon", "newton-muon", "muon-magma", "soap", "ademamix", "lion", "sf-adamw", "sf-sgd", "signsgd", "signum", "prodigy", "sophiag", "adopt", "mars", "adafactor", "lamb", "scion", "scion-light", "d-muon", "muon-pytorch"), None, False),
+    (("--opt",), "opt", "_StoreAction", "adamw", None, ("adamw", "gn-prox", "gn-full", "cadamw", "adamw-magma", "sgd", "muon", "newton-muon", "muon-magma", "softeq-k2000-muon", "soap", "ademamix", "lion", "sf-adamw", "sf-sgd", "signsgd", "signum", "prodigy", "sophiag", "adopt", "mars", "adafactor", "lamb", "scion", "scion-light", "d-muon", "muon-pytorch"), None, False),
     (("--batch_size",), "batch_size", "_StoreAction", 50, "int", None, None, False),
     (("--acc_steps",), "acc_steps", "_StoreAction", 1, "int", None, None, False),
     (("--weight_decay",), "weight_decay", "_StoreAction", 0.1, "float", None, None, False),
