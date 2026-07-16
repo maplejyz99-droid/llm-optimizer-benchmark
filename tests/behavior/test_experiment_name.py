@@ -49,6 +49,23 @@ class ExperimentNameBehaviorTest(unittest.TestCase):
 
         self.assertEqual(changed_runtime, baseline)
 
+    def test_notification_arguments_never_enter_generated_name(self):
+        secret = "name-secret-value"
+        baseline = self._name_for([])
+        notified = self._name_for(
+            [
+                "--notify_interval",
+                "10",
+                "--notify_method",
+                "email",
+                "--notify_smtp_pass",
+                secret,
+            ]
+        )
+
+        self.assertEqual(notified, baseline)
+        self.assertNotIn(secret, notified)
+
     def test_key_and_non_default_arguments_change_name(self):
         self.assertEqual(
             self._name_for(["--model", "mup_llama", "--opt", "muon", "--lr", "0.002"]),

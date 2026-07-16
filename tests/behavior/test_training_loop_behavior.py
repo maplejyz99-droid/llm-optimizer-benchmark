@@ -1,7 +1,10 @@
+import random
 import unittest
 from contextlib import nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
+
+import numpy as np
 
 from tests._helpers.training_harness import (
     loaded_training_base_module,
@@ -36,18 +39,23 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         checkpoint_iter=0,
         scheduler_override=USE_DEFAULT_SCHEDULER,
         master=True,
+        world_size=1,
+        rank=0,
         use_ddp=False,
         use_precond_optimizer=False,
         precond_flag=True,
         capture_overrides=None,
+        events=None,
     ):
-        events = []
+        events = [] if events is None else events
         capture = {"events": events, "checkpoint_iter": checkpoint_iter}
         if capture_overrides:
             capture.update(capture_overrides)
         model, opt, scheduler, backend, datareaders = make_train_components(
             events,
             master=master,
+            world_size=world_size,
+            rank=rank,
             use_ddp=use_ddp,
             use_precond_optimizer=use_precond_optimizer,
             precond_flag=precond_flag,
@@ -66,6 +74,31 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                     cfg=cfg,
                 )
         return events, stats
+
+    def test_raw_final_eval_uses_positive_cap_without_affecting_periodic_eval(self):
+        events = []
+        capture = {"events": events, "checkpoint_iter": 0}
+        cfg = make_training_cfg(
+            iterations=10,
+            eval_batches=2,
+            final_eval_batches=3,
+        )
+        _model, _opt, _scheduler, _backend, readers = make_train_components(events)
+        readers["val"].num_batches = lambda: 11
+
+        with loaded_training_base_module(capture) as training_base:
+            self.assertEqual(
+                training_base._get_eval_batch_count(10, readers["val"], cfg, False),
+                3,
+            )
+            self.assertEqual(
+                training_base._get_eval_batch_count(4, readers["val"], cfg, True),
+                3,
+            )
+            self.assertEqual(
+                training_base._get_eval_batch_count(4, readers["val"], cfg, False),
+                2,
+            )
 
     def test_normal_optimizer_one_step_order_is_preserved(self):
         cfg = make_training_cfg(iterations=1, scheduler="cos", eval_interval=100)
@@ -363,6 +396,22 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         )
         self.assertEqual(stats["completed_iterations"], 1)
 
+    def test_gn_rejects_multiple_ranks_before_data_or_optimizer_side_effects(self):
+        cfg = make_training_cfg(
+            iterations=1,
+            opt="gn-prox",
+            expected_world_size=2,
+        )
+        events = []
+
+        with self.assertRaisesRegex(RuntimeError, "single-rank"):
+            self.run_train(cfg, world_size=2, use_ddp=True, events=events)
+
+        names = event_names(events)
+        self.assertNotIn("get_batch", names)
+        self.assertNotIn("opt.step", names)
+        self.assertNotIn("save_checkpoint", names)
+
     def test_grad_clip_zero_skips_clip_but_keeps_optimizer_step(self):
         cfg = make_training_cfg(
             iterations=1,
@@ -420,6 +469,63 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertIn("final-val/loss", wandb_logs[2])
         self.assertEqual(events.count(("val.num_batches",)), 2)
         self.assertEqual(stats["completed_iterations"], 2)
+
+    def test_master_only_eval_and_weight_average_eval_finish_before_barrier(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            eval_interval=1,
+            exponential_weight_average=True,
+        )
+        events, _stats = self.run_train(cfg)
+
+        assert_in_order(self, event_names(events), ["eval", "eval_ewa", "barrier"])
+        self.assertEqual(events.count(("barrier",)), 1)
+
+    def test_evaluation_restores_training_rng_state(self):
+        cfg = make_training_cfg(iterations=0, eval_interval=1)
+        rng_state = {"value": 17}
+
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        try:
+            random.seed(123)
+            np.random.seed(456)
+            expected_python = random.Random(123).random()
+            expected_numpy = np.random.RandomState(456).random_sample()
+
+            self.run_train(
+                cfg,
+                capture_overrides={
+                    "eval_consumes_rng": True,
+                    "torch_rng_state": rng_state,
+                },
+            )
+
+            self.assertEqual(rng_state["value"], 17)
+            self.assertEqual(random.random(), expected_python)
+            self.assertEqual(np.random.random(), expected_numpy)
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+
+    def test_master_eval_failure_is_synchronized_before_all_ranks_raise(self):
+        cfg = make_training_cfg(iterations=0, eval_interval=1, expected_world_size=2)
+        events = []
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic eval failure"):
+            self.run_train(
+                cfg,
+                world_size=2,
+                events=events,
+                capture_overrides={
+                    "eval_error": RuntimeError("synthetic eval failure"),
+                },
+            )
+
+        names = event_names(events)
+        self.assertIn("all_gather_object", names)
+        self.assertNotIn("barrier", names)
+        self.assertNotIn("get_batch", names)
 
     def test_non_master_eval_and_log_returns_without_eval_side_effects(self):
         events = []
@@ -679,7 +785,7 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertIn(("wandb.Table.add_data", (6, 2.5, "Hello<generated>")), events)
         self.assertEqual(len(generated_logs), 1)
 
-    def test_weight_averager_initialization_uses_cfg_and_resume_count(self):
+    def test_weight_averager_initialization_and_resume_use_checkpoint_state(self):
         cfg = make_training_cfg(
             resume_from="/tmp/resume-source",
             iterations=6,
@@ -690,7 +796,17 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             wa_use_temp_dir=False,
             wa_dtype="float64",
         )
-        events, stats = self.run_train(cfg, checkpoint_iter=5)
+        events, stats = self.run_train(
+            cfg,
+            checkpoint_iter=5,
+            capture_overrides={
+                "checkpoint_training_state": {
+                    "iteration": 5,
+                    "train_reader_step": 5,
+                    "substep": 5,
+                },
+            },
+        )
 
         self.assertIn(
             (
@@ -700,11 +816,13 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                     "interval": 3,
                     "save_dir": "/tmp/llmopt-behavior-exp/avgs",
                     "dtype": "float64",
-                    "count": 5,
+                    "count": 0,
                 },
             ),
             events,
         )
+        load_events = [event for event in events if event[0] == "load_checkpoint"]
+        self.assertEqual(load_events[0][4], ("wa",))
         self.assertEqual(events.count(("weight_averager.step", True)), 1)
         self.assertEqual(stats["completed_iterations"], 1)
 
@@ -827,6 +945,50 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertEqual(notify_events[0][1]["lr"], 0.01)
         self.assertEqual(notify_events[0][1]["run_name"], "llmopt-behavior-exp")
         self.assertEqual(stats["completed_iterations"], 1)
+
+    def test_summary_stats_record_train_and_validation_metrics_with_semantics(self):
+        cfg = make_training_cfg(
+            iterations=1,
+            eval_interval=100,
+            log_interval=0,
+            metric_semantics={
+                "validation_loss": "next_token_cross_entropy",
+                "validation_accuracy": "token_accuracy_epfl_flat_eotpad_v1",
+            },
+        )
+        _events, stats = self.run_train(cfg)
+
+        self.assertEqual(stats["train_loss"], [2.0])
+        self.assertEqual(stats["val_loss"], [1.25, 1.25])
+        self.assertEqual(stats["val_pp"], [2.5, 2.5])
+        self.assertEqual(stats["val_acc"], [0.75, 0.75])
+        self.assertEqual(
+            stats["train_records"],
+            [{"iteration": 1, "tokens": 16, "loss": 2.0}],
+        )
+        self.assertEqual(
+            stats["validation_records"],
+            [
+                {
+                    "iteration": 0,
+                    "tokens": 0,
+                    "loss": 1.25,
+                    "perplexity": 2.5,
+                    "token_accuracy": 0.75,
+                },
+                {
+                    "iteration": 1,
+                    "tokens": 16,
+                    "loss": 1.25,
+                    "perplexity": 2.5,
+                    "token_accuracy": 0.75,
+                },
+            ],
+        )
+        self.assertEqual(
+            stats["metric_semantics"]["validation_accuracy"],
+            "token_accuracy_epfl_flat_eotpad_v1",
+        )
 
     def test_log_interval_zero_skips_train_wandb_but_still_notifies_master(self):
         cfg = make_training_cfg(
@@ -1003,6 +1165,50 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                 self.assertEqual(events.count(("scheduler.step",)), 1)
                 self.assertEqual(stats["completed_iterations"], 1)
 
+    def test_gn_checkpoint_and_resume_use_all_consumed_inner_batches(self):
+        initial_cfg = make_training_cfg(
+            iterations=1,
+            opt="gn-prox",
+            gn_inner_iters=2,
+            gn_linesearch=True,
+            latest_ckpt_interval=1,
+        )
+        initial_events, _stats = self.run_train(initial_cfg)
+        saved_positions = [
+            event[2]["train_reader_step"]
+            for event in initial_events
+            if event[0] == "save_checkpoint_metadata"
+        ]
+        self.assertEqual(saved_positions, [0, 4])
+
+        resumed_cfg = make_training_cfg(
+            resume_from="/tmp/resume-source",
+            iterations=2,
+            opt="gn-prox",
+            gn_inner_iters=2,
+            gn_linesearch=True,
+        )
+        resumed_events, resumed_stats = self.run_train(
+            resumed_cfg,
+            checkpoint_iter=1,
+            capture_overrides={
+                "checkpoint_training_state": {
+                    "iteration": 1,
+                    "train_reader_step": 4,
+                    "substep": 4,
+                },
+            },
+        )
+
+        self.assertIn(("train.set_step", 4), resumed_events)
+        resumed_batches = [
+            event
+            for event in resumed_events
+            if event[0] == "get_batch" and event[1] == "train"
+        ]
+        self.assertEqual(len(resumed_batches), 4)
+        self.assertEqual(resumed_stats["completed_iterations"], 1)
+
     def test_checkpoint_intervals_save_at_initial_and_final_iterations(self):
         cfg = make_training_cfg(
             iterations=1,
@@ -1023,6 +1229,88 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             ],
         )
         self.assertEqual(stats["completed_iterations"], 1)
+
+        metadata_events = [
+            event for event in events if event[0] == "save_checkpoint_metadata"
+        ]
+        self.assertEqual(
+            [event[2] for event in metadata_events],
+            [
+                {"iteration": 0, "train_reader_step": 0, "substep": 0},
+                {"iteration": 0, "train_reader_step": 0, "substep": 0},
+                {"iteration": 1, "train_reader_step": 1, "substep": 1},
+                {"iteration": 1, "train_reader_step": 1, "substep": 1},
+            ],
+        )
+        self.assertTrue(all(event[3] == "fake-run-identity" for event in metadata_events))
+        self.assertTrue(all(event[4] == 1 for event in metadata_events))
+
+    def test_checkpoint_waits_for_main_and_all_rank_worker_states(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            permanent_ckpt_interval=1,
+            latest_ckpt_interval=0,
+        )
+        events, _stats = self.run_train(cfg)
+
+        assert_in_order(
+            self,
+            event_names(events),
+            ["save_checkpoint", "barrier", "save_worker_state", "barrier"],
+        )
+
+    def test_checkpoint_failures_are_synchronized_before_the_next_collective(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            permanent_ckpt_interval=1,
+            latest_ckpt_interval=0,
+            expected_world_size=2,
+        )
+
+        main_events = []
+        with self.assertRaisesRegex(RuntimeError, "synthetic main save failure"):
+            self.run_train(
+                cfg,
+                world_size=2,
+                events=main_events,
+                capture_overrides={
+                    "save_checkpoint_error": RuntimeError(
+                        "synthetic main save failure"
+                    ),
+                },
+            )
+        assert_in_order(
+            self,
+            event_names(main_events),
+            ["save_checkpoint", "all_gather_object"],
+        )
+        self.assertNotIn("save_worker_state", event_names(main_events))
+        self.assertNotIn("barrier", event_names(main_events))
+
+        worker_events = []
+        with self.assertRaisesRegex(RuntimeError, "synthetic worker save failure"):
+            self.run_train(
+                cfg,
+                world_size=2,
+                events=worker_events,
+                capture_overrides={
+                    "save_worker_state_error": RuntimeError(
+                        "synthetic worker save failure"
+                    ),
+                },
+            )
+        assert_in_order(
+            self,
+            event_names(worker_events),
+            [
+                "save_checkpoint",
+                "all_gather_object",
+                "barrier",
+                "save_worker_state",
+                "all_gather_object",
+            ],
+        )
+        self.assertEqual(worker_events.count(("barrier",)), 1)
 
     def test_zero_iterations_evaluates_but_does_not_train(self):
         cfg = make_training_cfg(iterations=0, eval_interval=100)
@@ -1052,7 +1340,22 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             acc_steps=3,
             eval_interval=100,
         )
-        events, stats = self.run_train(cfg, checkpoint_iter=1)
+        events, stats = self.run_train(
+            cfg,
+            checkpoint_iter=1,
+            capture_overrides={
+                "checkpoint_training_state": {
+                    "iteration": 1,
+                    "train_reader_step": 7,
+                    "substep": 7,
+                },
+                "worker_training_state": {
+                    "iteration": 1,
+                    "train_reader_step": 7,
+                    "substep": 7,
+                },
+            },
+        )
         names = event_names(events)
 
         assert_in_order(
@@ -1068,11 +1371,32 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         )
         self.assertEqual(
             events[0],
-            ("load_checkpoint", "/tmp/resume-source/main.pt", "cpu", False),
+            (
+                "load_checkpoint",
+                "/tmp/resume-source/main.pt",
+                "cpu",
+                False,
+                (),
+                "fake-run-identity",
+                1,
+                False,
+                True,
+            ),
         )
-        self.assertEqual(events[1], ("load_worker_state", "/tmp/resume-source"))
+        self.assertEqual(
+            events[1],
+            (
+                "load_worker_state",
+                "/tmp/resume-source",
+                True,
+                0,
+                1,
+                "fake-snapshot-id",
+                False,
+            ),
+        )
         self.assertEqual(events[2], ("extend_onecycle_total_steps", False, 2))
-        self.assertIn(("train.set_step", 3), events)
+        self.assertIn(("train.set_step", 7), events)
         self.assertEqual(stats["completed_iterations"], 1)
 
     def test_resume_passes_none_scheduler_through_resume_helpers(self):
@@ -1086,16 +1410,106 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             cfg,
             checkpoint_iter=0,
             scheduler_override=None,
+            capture_overrides={
+                "checkpoint_training_state": {
+                    "iteration": 0,
+                    "train_reader_step": 0,
+                    "substep": 0,
+                },
+            },
         )
 
         self.assertEqual(
             events[0],
-            ("load_checkpoint", "/tmp/resume-source/main.pt", "cpu", True),
+            (
+                "load_checkpoint",
+                "/tmp/resume-source/main.pt",
+                "cpu",
+                True,
+                (),
+                "fake-run-identity",
+                1,
+                False,
+                True,
+            ),
         )
-        self.assertEqual(events[1], ("load_worker_state", "/tmp/resume-source"))
+        self.assertEqual(
+            events[1],
+            (
+                "load_worker_state",
+                "/tmp/resume-source",
+                True,
+                0,
+                1,
+                "fake-snapshot-id",
+                False,
+            ),
+        )
         self.assertEqual(events[2], ("extend_onecycle_total_steps", True, 1))
         self.assertIn(("train.set_step", 0), events)
         self.assertEqual(stats["completed_iterations"], 1)
+
+    def test_standard_legacy_resume_requires_explicit_opt_in_and_uses_old_formula(self):
+        cfg = make_training_cfg(
+            resume_from="/tmp/resume-source",
+            iterations=2,
+            acc_steps=3,
+            allow_legacy_checkpoint_resume=True,
+        )
+        events, stats = self.run_train(
+            cfg,
+            checkpoint_iter=1,
+            capture_overrides={"checkpoint_format_version": 0},
+        )
+
+        self.assertIn(("train.set_step", 3), events)
+        self.assertIn(
+            ("load_worker_state", "/tmp/resume-source", True, 0, 1, None, True),
+            events,
+        )
+        self.assertEqual(stats["completed_iterations"], 1)
+
+    def test_gn_legacy_resume_is_rejected_even_with_explicit_opt_in(self):
+        cfg = make_training_cfg(
+            resume_from="/tmp/resume-source",
+            iterations=2,
+            opt="gn-prox",
+            gn_inner_iters=2,
+            allow_legacy_checkpoint_resume=True,
+        )
+        events = []
+
+        with self.assertRaisesRegex(RuntimeError, "GN.*legacy"):
+            self.run_train(
+                cfg,
+                checkpoint_iter=1,
+                capture_overrides={"checkpoint_format_version": 0},
+                events=events,
+            )
+
+        self.assertNotIn("get_batch", event_names(events))
+
+    def test_versioned_resume_rejects_missing_or_inconsistent_reader_position(self):
+        for training_state, message in (
+            ({"iteration": 1}, "train_reader_step"),
+            (
+                {"iteration": 1, "train_reader_step": 4, "substep": 5},
+                "does not match",
+            ),
+        ):
+            with self.subTest(training_state=training_state):
+                cfg = make_training_cfg(
+                    resume_from="/tmp/resume-source",
+                    iterations=2,
+                )
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.run_train(
+                        cfg,
+                        checkpoint_iter=1,
+                        capture_overrides={
+                            "checkpoint_training_state": training_state,
+                        },
+                    )
 
     def test_checkpoint_saves_pass_none_scheduler_when_train_receives_none(self):
         cfg = make_training_cfg(

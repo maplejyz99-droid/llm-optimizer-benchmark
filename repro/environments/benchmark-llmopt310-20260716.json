@@ -1,0 +1,633 @@
+{
+  "collected_at_utc": "2026-07-15T19:28:50.120856+00:00",
+  "duplicate_distributions": {
+    "numpy": [
+      "2.2.5",
+      "2.2.6"
+    ],
+    "pillow": [
+      "12.0.0",
+      "12.1.0"
+    ],
+    "setuptools": [
+      "80.10.1",
+      "80.10.2"
+    ]
+  },
+  "gpu": {
+    "command": [
+      "/usr/bin/nvidia-smi",
+      "--query-gpu=name,driver_version",
+      "--format=csv,noheader"
+    ],
+    "returncode": null,
+    "stderr_lines": [
+      "[Errno 8] Exec format error: '/usr/bin/nvidia-smi'"
+    ],
+    "stdout_lines": []
+  },
+  "key_packages": {
+    "datasets": [
+      "2.19.2"
+    ],
+    "huggingface-hub": [
+      "0.24.6"
+    ],
+    "numpy": [
+      "2.2.5",
+      "2.2.6"
+    ],
+    "pyyaml": [
+      "6.0.3"
+    ],
+    "tiktoken": [
+      "0.12.0"
+    ],
+    "torch": [
+      "2.9.1+cu130"
+    ],
+    "transformers": [
+      "5.0.0"
+    ],
+    "triton": [
+      "3.5.1"
+    ],
+    "wandb": [
+      "0.24.1"
+    ]
+  },
+  "label": "benchmark-llmopt310",
+  "packages": [
+    {
+      "name": "aiohappyeyeballs",
+      "normalized_name": "aiohappyeyeballs",
+      "version": "2.6.1"
+    },
+    {
+      "name": "aiohttp",
+      "normalized_name": "aiohttp",
+      "version": "3.13.3"
+    },
+    {
+      "name": "aiosignal",
+      "normalized_name": "aiosignal",
+      "version": "1.4.0"
+    },
+    {
+      "name": "annotated-types",
+      "normalized_name": "annotated-types",
+      "version": "0.7.0"
+    },
+    {
+      "name": "anyio",
+      "normalized_name": "anyio",
+      "version": "4.12.1"
+    },
+    {
+      "name": "async-timeout",
+      "normalized_name": "async-timeout",
+      "version": "5.0.1"
+    },
+    {
+      "name": "attrs",
+      "normalized_name": "attrs",
+      "version": "25.4.0"
+    },
+    {
+      "name": "certifi",
+      "normalized_name": "certifi",
+      "version": "2026.1.4"
+    },
+    {
+      "name": "charset-normalizer",
+      "normalized_name": "charset-normalizer",
+      "version": "3.4.4"
+    },
+    {
+      "name": "click",
+      "normalized_name": "click",
+      "version": "8.3.1"
+    },
+    {
+      "name": "contourpy",
+      "normalized_name": "contourpy",
+      "version": "1.3.1"
+    },
+    {
+      "name": "cycler",
+      "normalized_name": "cycler",
+      "version": "0.12.1"
+    },
+    {
+      "name": "datasets",
+      "normalized_name": "datasets",
+      "version": "2.19.2"
+    },
+    {
+      "name": "dill",
+      "normalized_name": "dill",
+      "version": "0.3.8"
+    },
+    {
+      "name": "exceptiongroup",
+      "normalized_name": "exceptiongroup",
+      "version": "1.3.1"
+    },
+    {
+      "name": "filelock",
+      "normalized_name": "filelock",
+      "version": "3.20.3"
+    },
+    {
+      "name": "fonttools",
+      "normalized_name": "fonttools",
+      "version": "4.61.0"
+    },
+    {
+      "name": "frozenlist",
+      "normalized_name": "frozenlist",
+      "version": "1.8.0"
+    },
+    {
+      "name": "fsspec",
+      "normalized_name": "fsspec",
+      "version": "2024.3.1"
+    },
+    {
+      "name": "gitdb",
+      "normalized_name": "gitdb",
+      "version": "4.0.12"
+    },
+    {
+      "name": "GitPython",
+      "normalized_name": "gitpython",
+      "version": "3.1.46"
+    },
+    {
+      "name": "h11",
+      "normalized_name": "h11",
+      "version": "0.16.0"
+    },
+    {
+      "name": "hf-xet",
+      "normalized_name": "hf-xet",
+      "version": "1.2.0"
+    },
+    {
+      "name": "httpcore",
+      "normalized_name": "httpcore",
+      "version": "1.0.9"
+    },
+    {
+      "name": "httpx",
+      "normalized_name": "httpx",
+      "version": "0.27.2"
+    },
+    {
+      "name": "huggingface-hub",
+      "normalized_name": "huggingface-hub",
+      "version": "0.24.6"
+    },
+    {
+      "name": "idna",
+      "normalized_name": "idna",
+      "version": "3.11"
+    },
+    {
+      "name": "Jinja2",
+      "normalized_name": "jinja2",
+      "version": "3.1.6"
+    },
+    {
+      "name": "kiwisolver",
+      "normalized_name": "kiwisolver",
+      "version": "1.4.9"
+    },
+    {
+      "name": "MarkupSafe",
+      "normalized_name": "markupsafe",
+      "version": "2.1.5"
+    },
+    {
+      "name": "matplotlib",
+      "normalized_name": "matplotlib",
+      "version": "3.10.8"
+    },
+    {
+      "name": "mkl_fft",
+      "normalized_name": "mkl-fft",
+      "version": "2.1.1"
+    },
+    {
+      "name": "mkl_random",
+      "normalized_name": "mkl-random",
+      "version": "1.3.0"
+    },
+    {
+      "name": "mkl-service",
+      "normalized_name": "mkl-service",
+      "version": "2.5.2"
+    },
+    {
+      "name": "mpmath",
+      "normalized_name": "mpmath",
+      "version": "1.3.0"
+    },
+    {
+      "name": "multidict",
+      "normalized_name": "multidict",
+      "version": "6.7.1"
+    },
+    {
+      "name": "multiprocess",
+      "normalized_name": "multiprocess",
+      "version": "0.70.16"
+    },
+    {
+      "name": "networkx",
+      "normalized_name": "networkx",
+      "version": "3.4.2"
+    },
+    {
+      "name": "numpy",
+      "normalized_name": "numpy",
+      "version": "2.2.5"
+    },
+    {
+      "name": "numpy",
+      "normalized_name": "numpy",
+      "version": "2.2.6"
+    },
+    {
+      "name": "nvidia-cublas",
+      "normalized_name": "nvidia-cublas",
+      "version": "13.0.0.19"
+    },
+    {
+      "name": "nvidia-cuda-cupti",
+      "normalized_name": "nvidia-cuda-cupti",
+      "version": "13.0.48"
+    },
+    {
+      "name": "nvidia-cuda-nvrtc",
+      "normalized_name": "nvidia-cuda-nvrtc",
+      "version": "13.0.48"
+    },
+    {
+      "name": "nvidia-cuda-runtime",
+      "normalized_name": "nvidia-cuda-runtime",
+      "version": "13.0.48"
+    },
+    {
+      "name": "nvidia-cudnn-cu13",
+      "normalized_name": "nvidia-cudnn-cu13",
+      "version": "9.13.0.50"
+    },
+    {
+      "name": "nvidia-cufft",
+      "normalized_name": "nvidia-cufft",
+      "version": "12.0.0.15"
+    },
+    {
+      "name": "nvidia-cufile",
+      "normalized_name": "nvidia-cufile",
+      "version": "1.15.0.42"
+    },
+    {
+      "name": "nvidia-curand",
+      "normalized_name": "nvidia-curand",
+      "version": "10.4.0.35"
+    },
+    {
+      "name": "nvidia-cusolver",
+      "normalized_name": "nvidia-cusolver",
+      "version": "12.0.3.29"
+    },
+    {
+      "name": "nvidia-cusparse",
+      "normalized_name": "nvidia-cusparse",
+      "version": "12.6.2.49"
+    },
+    {
+      "name": "nvidia-cusparselt-cu13",
+      "normalized_name": "nvidia-cusparselt-cu13",
+      "version": "0.8.0"
+    },
+    {
+      "name": "nvidia-ml-py",
+      "normalized_name": "nvidia-ml-py",
+      "version": "13.590.48"
+    },
+    {
+      "name": "nvidia-nccl-cu13",
+      "normalized_name": "nvidia-nccl-cu13",
+      "version": "2.27.7"
+    },
+    {
+      "name": "nvidia-nvjitlink",
+      "normalized_name": "nvidia-nvjitlink",
+      "version": "13.0.39"
+    },
+    {
+      "name": "nvidia-nvshmem-cu13",
+      "normalized_name": "nvidia-nvshmem-cu13",
+      "version": "3.3.24"
+    },
+    {
+      "name": "nvidia-nvtx",
+      "normalized_name": "nvidia-nvtx",
+      "version": "13.0.39"
+    },
+    {
+      "name": "nvitop",
+      "normalized_name": "nvitop",
+      "version": "1.6.2"
+    },
+    {
+      "name": "packaging",
+      "normalized_name": "packaging",
+      "version": "26.0"
+    },
+    {
+      "name": "pandas",
+      "normalized_name": "pandas",
+      "version": "2.3.3"
+    },
+    {
+      "name": "pillow",
+      "normalized_name": "pillow",
+      "version": "12.0.0"
+    },
+    {
+      "name": "pillow",
+      "normalized_name": "pillow",
+      "version": "12.1.0"
+    },
+    {
+      "name": "pip",
+      "normalized_name": "pip",
+      "version": "26.0"
+    },
+    {
+      "name": "platformdirs",
+      "normalized_name": "platformdirs",
+      "version": "4.5.1"
+    },
+    {
+      "name": "propcache",
+      "normalized_name": "propcache",
+      "version": "0.4.1"
+    },
+    {
+      "name": "protobuf",
+      "normalized_name": "protobuf",
+      "version": "6.33.5"
+    },
+    {
+      "name": "psutil",
+      "normalized_name": "psutil",
+      "version": "7.2.2"
+    },
+    {
+      "name": "pyarrow",
+      "normalized_name": "pyarrow",
+      "version": "23.0.0"
+    },
+    {
+      "name": "pyarrow-hotfix",
+      "normalized_name": "pyarrow-hotfix",
+      "version": "0.7"
+    },
+    {
+      "name": "pydantic",
+      "normalized_name": "pydantic",
+      "version": "2.12.5"
+    },
+    {
+      "name": "pydantic_core",
+      "normalized_name": "pydantic-core",
+      "version": "2.41.5"
+    },
+    {
+      "name": "pyparsing",
+      "normalized_name": "pyparsing",
+      "version": "3.2.5"
+    },
+    {
+      "name": "PyQt6",
+      "normalized_name": "pyqt6",
+      "version": "6.9.1"
+    },
+    {
+      "name": "PyQt6_sip",
+      "normalized_name": "pyqt6-sip",
+      "version": "13.10.2"
+    },
+    {
+      "name": "python-dateutil",
+      "normalized_name": "python-dateutil",
+      "version": "2.9.0.post0"
+    },
+    {
+      "name": "pytz",
+      "normalized_name": "pytz",
+      "version": "2025.2"
+    },
+    {
+      "name": "PyYAML",
+      "normalized_name": "pyyaml",
+      "version": "6.0.3"
+    },
+    {
+      "name": "regex",
+      "normalized_name": "regex",
+      "version": "2026.1.15"
+    },
+    {
+      "name": "requests",
+      "normalized_name": "requests",
+      "version": "2.32.5"
+    },
+    {
+      "name": "safetensors",
+      "normalized_name": "safetensors",
+      "version": "0.7.0"
+    },
+    {
+      "name": "sentry-sdk",
+      "normalized_name": "sentry-sdk",
+      "version": "2.51.0"
+    },
+    {
+      "name": "setuptools",
+      "normalized_name": "setuptools",
+      "version": "80.10.1"
+    },
+    {
+      "name": "setuptools",
+      "normalized_name": "setuptools",
+      "version": "80.10.2"
+    },
+    {
+      "name": "shellingham",
+      "normalized_name": "shellingham",
+      "version": "1.5.4"
+    },
+    {
+      "name": "sip",
+      "normalized_name": "sip",
+      "version": "6.12.0"
+    },
+    {
+      "name": "six",
+      "normalized_name": "six",
+      "version": "1.17.0"
+    },
+    {
+      "name": "smmap",
+      "normalized_name": "smmap",
+      "version": "5.0.2"
+    },
+    {
+      "name": "sniffio",
+      "normalized_name": "sniffio",
+      "version": "1.3.1"
+    },
+    {
+      "name": "sympy",
+      "normalized_name": "sympy",
+      "version": "1.14.0"
+    },
+    {
+      "name": "tiktoken",
+      "normalized_name": "tiktoken",
+      "version": "0.12.0"
+    },
+    {
+      "name": "tokenizers",
+      "normalized_name": "tokenizers",
+      "version": "0.22.2"
+    },
+    {
+      "name": "tomli",
+      "normalized_name": "tomli",
+      "version": "2.4.0"
+    },
+    {
+      "name": "torch",
+      "normalized_name": "torch",
+      "version": "2.9.1+cu130"
+    },
+    {
+      "name": "torchaudio",
+      "normalized_name": "torchaudio",
+      "version": "2.9.1+cu130"
+    },
+    {
+      "name": "torchvision",
+      "normalized_name": "torchvision",
+      "version": "0.24.1+cu130"
+    },
+    {
+      "name": "tornado",
+      "normalized_name": "tornado",
+      "version": "6.5.4"
+    },
+    {
+      "name": "tqdm",
+      "normalized_name": "tqdm",
+      "version": "4.67.3"
+    },
+    {
+      "name": "transformers",
+      "normalized_name": "transformers",
+      "version": "5.0.0"
+    },
+    {
+      "name": "triton",
+      "normalized_name": "triton",
+      "version": "3.5.1"
+    },
+    {
+      "name": "typer-slim",
+      "normalized_name": "typer-slim",
+      "version": "0.21.1"
+    },
+    {
+      "name": "typing_extensions",
+      "normalized_name": "typing-extensions",
+      "version": "4.15.0"
+    },
+    {
+      "name": "typing-inspection",
+      "normalized_name": "typing-inspection",
+      "version": "0.4.2"
+    },
+    {
+      "name": "tzdata",
+      "normalized_name": "tzdata",
+      "version": "2025.3"
+    },
+    {
+      "name": "urllib3",
+      "normalized_name": "urllib3",
+      "version": "2.6.3"
+    },
+    {
+      "name": "wandb",
+      "normalized_name": "wandb",
+      "version": "0.24.1"
+    },
+    {
+      "name": "wheel",
+      "normalized_name": "wheel",
+      "version": "0.46.3"
+    },
+    {
+      "name": "xxhash",
+      "normalized_name": "xxhash",
+      "version": "3.6.0"
+    },
+    {
+      "name": "yarl",
+      "normalized_name": "yarl",
+      "version": "1.22.0"
+    },
+    {
+      "name": "zstandard",
+      "normalized_name": "zstandard",
+      "version": "0.25.0"
+    }
+  ],
+  "pip_check": {
+    "command": [
+      "/root/miniconda3/envs/llmopt310/bin/python",
+      "-m",
+      "pip",
+      "check"
+    ],
+    "returncode": 1,
+    "stderr_lines": [],
+    "stdout_lines": [
+      "transformers 5.0.0 has requirement huggingface-hub<2.0,>=1.3.0, but you have huggingface-hub 0.24.6."
+    ]
+  },
+  "platform": {
+    "libc": [
+      "glibc",
+      "2.35"
+    ],
+    "machine": "x86_64",
+    "release": "5.15.0-78-generic",
+    "system": "Linux",
+    "version": "#85-Ubuntu SMP Fri Jul 7 15:25:09 UTC 2023"
+  },
+  "python": {
+    "executable": "/root/miniconda3/envs/llmopt310/bin/python",
+    "implementation": "CPython",
+    "pip_version": "26.0",
+    "soabi": "cpython-310-x86_64-linux-gnu",
+    "version": "3.10.19"
+  },
+  "schema_version": 1
+}

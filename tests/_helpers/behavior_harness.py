@@ -30,6 +30,27 @@ def patched_modules(replacements):
                 sys.modules[name] = old_module
 
 
+@contextmanager
+def isolated_modules(*prefixes):
+    """Restore the exact module cache for project-owned prefixes on exit."""
+    prefixes = tuple(prefixes)
+
+    def matches(name):
+        return any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes)
+
+    previous = {name: module for name, module in sys.modules.items() if matches(name)}
+    for name in list(sys.modules):
+        if matches(name):
+            sys.modules.pop(name, None)
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if matches(name):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous)
+
+
 def load_module_from_path(path, replacements=None, package=None):
     module_name = f"_behavior_{path.stem}_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(
@@ -181,9 +202,12 @@ class FakeTinyModel:
 
 
 class FakeBackend:
-    def __init__(self, args):
+    def __init__(self, args, world_size=1):
         self.args = args
+        self.world_size = world_size
         self.finalized = False
+        self.finalize_count = 0
+        self.barrier_count = 0
 
     def transform_model(self, model):
         return model
@@ -192,7 +216,7 @@ class FakeBackend:
         return args
 
     def get_world_size(self):
-        return 1
+        return self.world_size
 
     def is_master_process(self):
         return True
@@ -203,8 +227,18 @@ class FakeBackend:
     def translate_model_parameter_name_for_node(self, parameter_name):
         return [parameter_name]
 
+    def barrier(self):
+        self.barrier_count += 1
+
+    def broadcast_object(self, value, src=0):
+        return value
+
+    def all_gather_object(self, value):
+        return [value] * self.get_world_size()
+
     def finalize(self):
         self.finalized = True
+        self.finalize_count += 1
 
 
 class FakeOptimizer:
@@ -311,8 +345,23 @@ def make_fake_main_replacements(capture):
     config_module.registered_formats = lambda: ["base"]
     config_module.parse_args_with_format = lambda format, base_parser, args, namespace: namespace
 
+    wandb_module = types.ModuleType("wandb")
+
+    def wandb_init(**kwargs):
+        capture["wandb_init_kwargs"] = kwargs
+
+    wandb_module.init = wandb_init
+    wandb_module.define_metric = lambda *args, **kwargs: None
+    wandb_module.log = lambda *args, **kwargs: None
+
     distributed_module = types.ModuleType("distributed")
-    distributed_module.make_backend_from_args = lambda args: FakeBackend(args)
+
+    def make_backend_from_args(args):
+        backend = FakeBackend(args, world_size=capture.get("world_size", 1))
+        capture["backend"] = backend
+        return backend
+
+    distributed_module.make_backend_from_args = make_backend_from_args
     distributed_module.registered_backends = lambda: [None, "nccl"]
 
     data_utils_module = types.ModuleType("data.utils")
@@ -320,12 +369,19 @@ def make_fake_main_replacements(capture):
     data_utils_module.get_dataset = lambda args: {}
 
     models_utils_module = types.ModuleType("models.utils")
-    models_utils_module.get_model = lambda args: FakeTinyModel()
+
+    def get_model(args):
+        capture["get_model_calls"] = capture.get("get_model_calls", 0) + 1
+        return FakeTinyModel()
+
+    models_utils_module.get_model = get_model
 
     optim_base_module = types.ModuleType("optim.base")
 
     def fake_train(**kwargs):
         capture["train_kwargs"] = kwargs
+        if "train_error" in capture:
+            raise capture["train_error"]
         return {"captured": True}
 
     optim_base_module.train = fake_train
@@ -353,9 +409,65 @@ def make_fake_main_replacements(capture):
     schedule_module.cos_inf_schedule = lambda **kwargs: (lambda step: 1.0)
     schedule_module.wsd_schedule = lambda **kwargs: (lambda step: 1.0)
 
+    run_manifest_module = types.ModuleType("run_manifest")
+    run_manifest_module.build_data_manifest = lambda dataset, sources: {
+        "schema_version": 1,
+        "dataset": dataset,
+        "semantics_id": "flat-next-token-v1",
+        "artifacts": {},
+        "identity": "fake-data-identity",
+    }
+
+    def build_run_manifest(args, data_manifest, **kwargs):
+        manifest = {
+            "schema_version": 1,
+            "run_identity": "fake-run-identity",
+            "data": data_manifest,
+            "metric_semantics": {
+                "validation_accuracy": "next_token_accuracy",
+            },
+        }
+        capture["run_manifest"] = manifest
+        return manifest
+
+    run_manifest_module.build_run_manifest = build_run_manifest
+    run_manifest_module.collect_runtime_identity = lambda: {
+        "python": {"version": "3.10.19"},
+        "packages": {},
+    }
+
+    def sanitized_config(args):
+        capture["sanitized_config_calls"] = capture.get("sanitized_config_calls", 0) + 1
+        sanitized = {}
+        safe_notify_keys = {
+            "notify_interval",
+            "notify_method",
+        }
+        for key, value in vars(args).items():
+            if key.startswith("notify_") and key not in safe_notify_keys:
+                sanitized[key] = None if value is None else "<redacted>"
+            else:
+                sanitized[key] = value
+        return sanitized
+
+    run_manifest_module.sanitized_config = sanitized_config
+
+    def ensure_compatible_manifest(path, manifest):
+        capture.setdefault("lifecycle_events", []).append("manifest_checked")
+        if "manifest_error" in capture:
+            raise capture["manifest_error"]
+
+    run_manifest_module.ensure_compatible_manifest = ensure_compatible_manifest
+
+    def write_json_atomic(path, payload):
+        capture.setdefault("atomic_json_writes", []).append((Path(path), payload))
+
+    run_manifest_module.write_json_atomic = write_json_atomic
+
     return {
         "numpy": numpy_module,
         "torch": make_fake_torch_module(),
+        "wandb": wandb_module,
         "config": config_module,
         "distributed": distributed_module,
         "data": types.ModuleType("data"),
@@ -383,6 +495,7 @@ def make_fake_main_replacements(capture):
         "optim.experimental": experimental_module,
         "optim.experimental.softeq_muon": softeq_muon_module,
         "optim.sophia": make_optimizer_module("SophiaG"),
+        "run_manifest": run_manifest_module,
     }
 
 

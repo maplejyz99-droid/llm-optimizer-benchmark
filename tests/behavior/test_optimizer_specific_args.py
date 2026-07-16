@@ -81,7 +81,7 @@ class OptimizerSpecificCliArgumentBehaviorTest(unittest.TestCase):
             "--mars_vr_gamma",
             "0.031",
             "--mars_is_approx",
-            "0",
+            "False",
         )
 
         self.assertEqual(args.opt, "mars")
@@ -90,7 +90,7 @@ class OptimizerSpecificCliArgumentBehaviorTest(unittest.TestCase):
         self.assertEqual(args.mars_beta2, 0.997)
         self.assertEqual(args.mars_type, "mars-shampoo")
         self.assertEqual(args.mars_vr_gamma, 0.031)
-        self.assertEqual(args.mars_is_approx, 0.0)
+        self.assertIs(args.mars_is_approx, False)
 
     def test_prodigy_specific_arguments_are_parseable(self):
         args = self.parse(

@@ -25,6 +25,14 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         self.assertEqual(opt.kwargs["weight_decay"], cfg.weight_decay)
         self.assertEqual(type(scheduler).__name__, "OneCycleLR")
 
+    def test_programmatic_unknown_optimizer_is_rejected_instead_of_becoming_sgd(self):
+        main_module = load_main_with_fakes({})
+        args, _ = make_args_for_main(["--opt", "sgd"])
+        args.opt = "not-a-real-optimizer"
+
+        with self.assertRaisesRegex(ValueError, "Unknown optimizer"):
+            main_module.build_optimizer(args, None, [], set())
+
     def test_gn_uses_inner_adamw_and_zero_weight_decay(self):
         opt, scheduler, cfg = self._run_main(
             ["--opt", "gn-prox", "--gn_inner_lr", "0.004", "--gn_inner_wd", "0.3"]
@@ -341,6 +349,30 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
                     self.assertEqual(type(scheduler).__name__, "FakeCombinedScheduler")
                 else:
                     self.assertEqual(opt.kwargs["lr"], cfg.lr)
+
+    def test_muon_magma_remains_available_for_single_rank(self):
+        capture = {"world_size": 1}
+        main_module = load_main_with_fakes(capture)
+        args, parser = make_args_for_main(["--opt", "muon-magma"])
+
+        with redirect_stdout(StringIO()):
+            main_module.main(args, parser)
+
+        self.assertEqual(type(capture["train_kwargs"]["opt"]).__name__, "MagmaMuon")
+        self.assertEqual(capture["train_kwargs"]["cfg"].world_size, 1)
+
+    def test_magma_optimizer_build_rejects_multirank_world_size(self):
+        main_module = load_main_with_fakes({})
+        for opt_name, label in (
+            ("adamw-magma", "AdamW Magma"),
+            ("muon-magma", "Muon Magma"),
+        ):
+            with self.subTest(opt=opt_name):
+                args, _ = make_args_for_main(["--opt", opt_name])
+                args.world_size = 2
+
+                with self.assertRaisesRegex(ValueError, f"{label}.*world_size=1"):
+                    main_module.build_optimizer(args, None, [], set())
 
     def test_distributed_muon_keeps_group_specs_and_muon_parameters(self):
         opt, _, cfg = self._run_main(

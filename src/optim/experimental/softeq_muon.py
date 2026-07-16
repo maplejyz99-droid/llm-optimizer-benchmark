@@ -49,6 +49,9 @@ class SoftEqK2000Muon(torch.optim.Optimizer):
     contract as the local Muon baseline.
     """
 
+    # Matrix momentum is created only by the rank that owns each update.
+    requires_rank_local_state = True
+
     def __init__(
         self,
         muon_params,

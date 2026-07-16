@@ -13,7 +13,7 @@ from .fineweb_edu import get_fineweb_edu_data
 from .openwebtext2 import get_openwebtext2_data
 from .redpajama import get_redpajama_data, get_redpajamav2_data
 from .shakespeare import get_shakespeare_data
-from .slimpajama import get_slimpajama_data
+from .slimpajama import get_slimpajama_chunk1, get_slimpajama_data
 from .wikitext import get_wikitext_data
 
 
@@ -44,6 +44,8 @@ def get_dataset(args) -> Dict[str, np.ndarray]:
         return get_redpajamav2_data(args.datasets_dir)
     if args.dataset == "slimpajama":
         return get_slimpajama_data(args.datasets_dir)
+    if args.dataset == "slimpajama_chunk1":
+        return get_slimpajama_chunk1(args.datasets_dir)
     if args.dataset == "fineweb":
         return get_fineweb_data(args.datasets_dir)
     if args.dataset == "finewebedu":

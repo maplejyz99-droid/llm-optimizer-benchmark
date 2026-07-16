@@ -133,8 +133,9 @@ class NewtonMuon(torch.optim.Optimizer):
         return state
 
     def load_state_dict(self, state_dict):
-        self.global_step = state_dict.pop("newton_muon_global_step", 0)
-        return super().load_state_dict(state_dict)
+        optimizer_state = dict(state_dict)
+        self.global_step = optimizer_state.pop("newton_muon_global_step", 0)
+        return super().load_state_dict(optimizer_state)
 
     def _register_precond_param(self, p, kind, accum, count):
         if p not in self.state or not self.state[p].get("use_muon", False):

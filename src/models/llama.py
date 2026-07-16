@@ -103,29 +103,37 @@ class LlamaMLP(nn.Module):
         self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.w2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
         self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
-        self.register_buffer(
-            "newton_muon_fc_accum",
-            torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "newton_muon_fc_count", torch.zeros((), dtype=torch.float32), persistent=False
-        )
-        if hidden_dim % 4 != 0:
-            raise ValueError("Newton-Muon expects Llama MLP hidden_dim divisible by 4.")
-        proj_block = hidden_dim // 4
-        self.register_buffer(
-            "newton_muon_proj_accum",
-            torch.zeros(4, proj_block, proj_block, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "newton_muon_proj_count",
-            torch.zeros((), dtype=torch.float32),
-            persistent=False,
-        )
+        self.newton_muon_enabled = getattr(config, "opt", None) == "newton-muon"
+        if self.newton_muon_enabled:
+            self.register_buffer(
+                "newton_muon_fc_accum",
+                torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "newton_muon_fc_count",
+                torch.zeros((), dtype=torch.float32),
+                persistent=False,
+            )
+            if hidden_dim % 4 != 0:
+                raise ValueError(
+                    "Newton-Muon expects Llama MLP hidden_dim divisible by 4."
+                )
+            proj_block = hidden_dim // 4
+            self.register_buffer(
+                "newton_muon_proj_accum",
+                torch.zeros(4, proj_block, proj_block, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "newton_muon_proj_count",
+                torch.zeros((), dtype=torch.float32),
+                persistent=False,
+            )
 
     def forward(self, x, precond_flag=False):
+        if precond_flag and not self.newton_muon_enabled:
+            raise RuntimeError("Newton-Muon preconditioning requested without buffers.")
         if precond_flag:
             _accumulate_xtx(x, self.newton_muon_fc_accum, self.newton_muon_fc_count)
         # tuple form because of aux loss from MoE
@@ -140,24 +148,28 @@ class LlamaMLP(nn.Module):
 class LlamaAttention(CausalSelfAttention):
     def __init__(self, config):
         super().__init__(config)
-        self.register_buffer(
-            "newton_muon_qkv_accum",
-            torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "newton_muon_qkv_count",
-            torch.zeros((), dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "newton_muon_o_accum",
-            torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "newton_muon_o_count", torch.zeros((), dtype=torch.float32), persistent=False
-        )
+        self.newton_muon_enabled = getattr(config, "opt", None) == "newton-muon"
+        if self.newton_muon_enabled:
+            self.register_buffer(
+                "newton_muon_qkv_accum",
+                torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "newton_muon_qkv_count",
+                torch.zeros((), dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "newton_muon_o_accum",
+                torch.zeros(config.n_embd, config.n_embd, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "newton_muon_o_count",
+                torch.zeros((), dtype=torch.float32),
+                persistent=False,
+            )
 
     def forward(self, x, freqs_cis, precond_flag=False):
         # batch size, sequence length, embedding dimensionality (n_embd)
@@ -166,6 +178,8 @@ class LlamaAttention(CausalSelfAttention):
             T,
             C,
         ) = x.size()
+        if precond_flag and not self.newton_muon_enabled:
+            raise RuntimeError("Newton-Muon preconditioning requested without buffers.")
         if precond_flag:
             _accumulate_xtx(x, self.newton_muon_qkv_accum, self.newton_muon_qkv_count)
 
@@ -185,7 +199,12 @@ class LlamaAttention(CausalSelfAttention):
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
             )
         else:
             # manual implementation of attention

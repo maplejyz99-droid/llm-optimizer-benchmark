@@ -459,6 +459,10 @@ class Muon(torch.optim.Optimizer):
         adamw_wd: The weight decay for the internal AdamW.
     """
 
+    # Matrix momentum is created only by the rank that owns each update.
+    # MagmaMuon inherits this contract from Muon.
+    requires_rank_local_state = True
+
     def __init__(
         self,
         muon_params,

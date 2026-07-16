@@ -6,7 +6,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
-from tests._helpers.behavior_harness import SRC_ROOT
+from tests._helpers.behavior_harness import SRC_ROOT, isolated_modules
 
 try:
     import torch
@@ -145,24 +145,21 @@ class TorchSmokeTest(unittest.TestCase):
         before = [param.detach().clone() for param in model.parameters()]
 
         old_path = list(sys.path)
-        old_base = sys.modules.pop("optim.base", None)
         sys.path.insert(0, str(SRC_ROOT))
         try:
-            training_base = importlib.import_module("optim.base")
-            with tempfile.TemporaryDirectory() as tmpdir:
-                stats = training_base.train(
-                    model=model,
-                    opt=optimizer,
-                    datareaders=datareaders,
-                    scheduler=None,
-                    exp_dir=Path(tmpdir),
-                    distributed_backend=SingleProcessBackend(),
-                    cfg=cfg,
-                )
+            with isolated_modules("optim"):
+                training_base = importlib.import_module("optim.base")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    stats = training_base.train(
+                        model=model,
+                        opt=optimizer,
+                        datareaders=datareaders,
+                        scheduler=None,
+                        exp_dir=Path(tmpdir),
+                        distributed_backend=SingleProcessBackend(),
+                        cfg=cfg,
+                    )
         finally:
-            sys.modules.pop("optim.base", None)
-            if old_base is not None:
-                sys.modules["optim.base"] = old_base
             sys.path[:] = old_path
 
         changed = any(

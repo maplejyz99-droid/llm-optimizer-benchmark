@@ -5,14 +5,15 @@ from unittest import mock
 
 import torch
 
-from tests._helpers.behavior_harness import SRC_ROOT
+from tests._helpers.behavior_harness import SRC_ROOT, isolated_modules
 
 
 def load_softeq_module():
     old_path = list(sys.path)
     sys.path.insert(0, str(SRC_ROOT))
     try:
-        return importlib.import_module("optim.experimental.softeq_muon")
+        with isolated_modules("optim"):
+            return importlib.import_module("optim.experimental.softeq_muon")
     finally:
         sys.path[:] = old_path
 

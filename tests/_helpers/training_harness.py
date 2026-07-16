@@ -1,10 +1,18 @@
 import importlib
+import random
 import sys
 import types
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
-from tests._helpers.behavior_harness import REPO_ROOT, SRC_ROOT, patched_modules
+import numpy as np
+
+from tests._helpers.behavior_harness import (
+    REPO_ROOT,
+    SRC_ROOT,
+    isolated_modules,
+    patched_modules,
+)
 
 
 class FakeScalar:
@@ -164,8 +172,10 @@ class FakeDataReader:
         self.num_tokens = 10_000
         self.steps = []
         self.batch_count = 0
+        self.step = 0
 
     def set_step(self, step):
+        self.step = step
         self.steps.append(step)
         self.events.append((f"{self.name}.set_step", step))
 
@@ -175,10 +185,11 @@ class FakeDataReader:
 
 
 class FakeDistributedBackendForTrain:
-    def __init__(self, events, master=True, world_size=1):
+    def __init__(self, events, master=True, world_size=1, rank=0):
         self.events = events
         self.master = master
         self.world_size = world_size
+        self.rank = rank
 
     def is_master_process(self):
         return self.master
@@ -188,6 +199,17 @@ class FakeDistributedBackendForTrain:
 
     def get_raw_model(self, model):
         return model
+
+    def barrier(self):
+        self.events.append(("barrier",))
+
+    def broadcast_object(self, value, src=0):
+        self.events.append(("broadcast_object", value, src))
+        return value
+
+    def all_gather_object(self, value):
+        self.events.append(("all_gather_object", value))
+        return [value] * self.world_size
 
     def get_context_for_microstep_forward(
         self, model, microstep_idx, gradient_accumulation_steps
@@ -204,6 +226,9 @@ def make_training_cfg(**overrides):
         "device": "cpu",
         "dtype": "float32",
         "resume_from": None,
+        "allow_legacy_checkpoint_resume": False,
+        "run_identity": "fake-run-identity",
+        "expected_world_size": 1,
         "iterations": 1,
         "acc_steps": 1,
         "sequence_length": 8,
@@ -243,12 +268,16 @@ def make_training_cfg(**overrides):
         "gn_ls_range": [1.0],
         "sophia_bs": 1,
         "precondition_frequency": 10,
+        "metric_semantics": {
+            "validation_loss": "next_token_cross_entropy",
+            "validation_accuracy": "next_token_accuracy",
+        },
     }
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)
 
 
-def make_fake_torch_for_train(events):
+def make_fake_torch_for_train(events, capture):
     torch = types.ModuleType("torch")
     torch.float32 = "float32"
     torch.float16 = "float16"
@@ -256,6 +285,12 @@ def make_fake_torch_for_train(events):
     torch.float64 = "float64"
     torch.compile = lambda model: model
     torch.amp = types.SimpleNamespace(autocast=lambda **kwargs: nullcontext())
+    rng_state = capture.setdefault("torch_rng_state", {"value": 0})
+    torch.random = types.SimpleNamespace(
+        get_rng_state=lambda: rng_state["value"],
+        set_rng_state=lambda value: rng_state.__setitem__("value", value),
+    )
+    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
 
     def clip_grad_norm_(parameters, max_norm):
         events.append(("clip_grad_norm", tuple(parameters), max_norm))
@@ -386,6 +421,7 @@ def make_training_replacements(capture):
     def fake_get_batch(reader, device):
         events.append(("get_batch", reader.name, device))
         reader.batch_count += 1
+        reader.step += 1
         if capture.get("unique_batches"):
             return f"{reader.name}_x_{reader.batch_count}", f"{reader.name}_y_{reader.batch_count}"
         return f"{reader.name}_x", f"{reader.name}_y"
@@ -401,6 +437,12 @@ def make_training_replacements(capture):
         cfg,
     ):
         events.append(("eval", max_num_batches, moe, get_router_logits))
+        if "eval_error" in capture:
+            raise capture["eval_error"]
+        if capture.get("eval_consumes_rng"):
+            capture["torch_rng_state"]["value"] += 1
+            random.random()
+            np.random.random()
         return (
             0.75,
             1.25,
@@ -409,30 +451,127 @@ def make_training_replacements(capture):
             capture.get("router_logits", []),
         )
 
-    def fake_save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir):
+    def fake_save_checkpoint(
+        model,
+        opt,
+        scheduler,
+        curr_iter,
+        ckpt_dir,
+        *,
+        training_state=None,
+        run_identity=None,
+        world_size=None,
+        averagers=None,
+    ):
         events.append(("save_checkpoint", curr_iter, Path(ckpt_dir).as_posix()))
+        if "save_checkpoint_error" in capture:
+            raise capture["save_checkpoint_error"]
         events.append(("save_checkpoint_scheduler_is_none", curr_iter, scheduler is None))
+        events.append(
+            (
+                "save_checkpoint_metadata",
+                curr_iter,
+                dict(training_state or {}),
+                run_identity,
+                world_size,
+                tuple(sorted((averagers or {}).keys())),
+            )
+        )
+        return capture.get("snapshot_id", "fake-snapshot-id")
 
-    def fake_save_worker_state(ckpt_dir):
+    def fake_save_worker_state(
+        ckpt_dir,
+        opt=None,
+        training_state=None,
+        *,
+        world_size=None,
+        rank=None,
+        snapshot_id=None,
+    ):
         events.append(("save_worker_state", Path(ckpt_dir).as_posix()))
+        if "save_worker_state_error" in capture:
+            raise capture["save_worker_state_error"]
+        events.append(
+            (
+                "save_worker_state_metadata",
+                dict(training_state or {}),
+                opt is not None,
+                world_size,
+                rank,
+                snapshot_id,
+            )
+        )
 
     utils_module.get_batch = fake_get_batch
     utils_module.eval = fake_eval
     utils_module.save_checkpoint = fake_save_checkpoint
     utils_module.save_worker_state = fake_save_worker_state
-    def fake_load_checkpoint(model, opt, scheduler, ckpt_path, device):
+    def fake_load_checkpoint(
+        model,
+        opt,
+        scheduler,
+        ckpt_path,
+        device,
+        *,
+        averagers=None,
+        expected_run_identity=None,
+        expected_world_size=None,
+        allow_legacy=False,
+        return_metadata=False,
+    ):
         events.append(
             (
                 "load_checkpoint",
                 Path(ckpt_path).as_posix(),
                 device,
                 scheduler is None,
+                tuple(sorted((averagers or {}).keys())),
+                expected_run_identity,
+                expected_world_size,
+                allow_legacy,
+                return_metadata,
             )
         )
-        return capture.get("checkpoint_iter", 0)
+        checkpoint_iter = capture.get("checkpoint_iter", 0)
+        result = capture.get(
+            "checkpoint_metadata",
+            types.SimpleNamespace(
+                iteration=checkpoint_iter,
+                training_state=dict(capture.get("checkpoint_training_state", {})),
+                run_identity=expected_run_identity,
+                world_size=expected_world_size,
+                format_version=capture.get("checkpoint_format_version", 3),
+                averager_names=tuple(sorted((averagers or {}).keys())),
+                snapshot_id=(
+                    None
+                    if capture.get("checkpoint_format_version", 3) == 0
+                    else capture.get("snapshot_id", "fake-snapshot-id")
+                ),
+            ),
+        )
+        return result if return_metadata else result.iteration
 
-    def fake_load_worker_state(ckpt_dir):
-        events.append(("load_worker_state", Path(ckpt_dir).as_posix()))
+    def fake_load_worker_state(
+        ckpt_dir,
+        opt=None,
+        *,
+        rank=None,
+        expected_world_size=None,
+        expected_snapshot_id=None,
+        allow_legacy=False,
+    ):
+        events.append(
+            (
+                "load_worker_state",
+                Path(ckpt_dir).as_posix(),
+                opt is not None,
+                rank,
+                expected_world_size,
+                expected_snapshot_id,
+                allow_legacy,
+            )
+        )
+        return dict(capture.get("worker_training_state", {}))
 
     def fake_extend_onecycle_total_steps(scheduler, iterations):
         events.append(("extend_onecycle_total_steps", scheduler is None, iterations))
@@ -464,7 +603,7 @@ def make_training_replacements(capture):
     wandb_module.run = types.SimpleNamespace(name="fake-run")
 
     return {
-        "torch": make_fake_torch_for_train(events),
+        "torch": make_fake_torch_for_train(events, capture),
         "yaml": yaml_module,
         "logger": logger_pkg,
         "logger.logger": logger_module,
@@ -478,18 +617,15 @@ def make_training_replacements(capture):
 
 @contextmanager
 def loaded_training_base_module(capture):
-    sentinel = object()
-    old_base = sys.modules.pop("optim.base", sentinel)
     old_path = list(sys.path)
     sys.path.insert(0, str(SRC_ROOT))
     try:
-        with patched_modules(make_training_replacements(capture)):
+        with isolated_modules("optim"), patched_modules(
+            make_training_replacements(capture)
+        ):
             module = importlib.import_module("optim.base")
             yield module
     finally:
-        sys.modules.pop("optim.base", None)
-        if old_base is not sentinel:
-            sys.modules["optim.base"] = old_base
         sys.path[:] = old_path
 
 
@@ -497,6 +633,7 @@ def make_train_components(
     events,
     master=True,
     world_size=1,
+    rank=0,
     use_ddp=False,
     use_precond_optimizer=False,
     precond_flag=True,
@@ -511,7 +648,7 @@ def make_train_components(
     )
     scheduler = FakeSchedulerForTrain(events)
     backend = FakeDistributedBackendForTrain(
-        events, master=master, world_size=world_size
+        events, master=master, world_size=world_size, rank=rank
     )
     datareaders = {
         "train": FakeDataReader("train", events),
