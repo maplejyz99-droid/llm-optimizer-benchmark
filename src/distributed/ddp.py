@@ -2,8 +2,14 @@ import math
 import os
 from contextlib import contextmanager
 
-from torch.distributed import (destroy_process_group, get_world_size,
-                               init_process_group)
+from torch.distributed import (
+    all_gather_object as distributed_all_gather_object,
+    barrier as distributed_barrier,
+    broadcast_object_list,
+    destroy_process_group,
+    get_world_size,
+    init_process_group,
+)
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .backend import DistributedBackend
@@ -11,31 +17,51 @@ from .backend import DistributedBackend
 
 class DataParallelDistributedBackend(DistributedBackend):
     def __init__(self, args):
-        self.rank = int(os.environ.get("RANK", -1))
-        assert self.rank != -1, "DDP backend can not be used without rank"
-        assert "cuda" in args.device, "DDP backend can not be used on non-CUDA devices"
-        init_process_group(backend=args.distributed_backend)
-        self.local_rank = int(os.environ["LOCAL_RANK"])
+        try:
+            self.rank = int(os.environ["RANK"])
+            self.local_rank = int(os.environ["LOCAL_RANK"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                "DDP requires integer RANK and LOCAL_RANK environment variables."
+            ) from exc
+        if self.rank < 0 or self.local_rank < 0:
+            raise ValueError("DDP RANK and LOCAL_RANK must be non-negative.")
+        if "cuda" not in args.device:
+            raise ValueError("DDP backend can not be used on non-CUDA devices.")
+
+        initialized = False
+        try:
+            init_process_group(backend=args.distributed_backend)
+            initialized = True
+            get_world_size()
+        except BaseException:
+            if initialized:
+                try:
+                    destroy_process_group()
+                except BaseException:
+                    pass
+            raise
 
     def get_adjusted_args_for_process(self, args):
         effective_batch_size = args.batch_size * args.acc_steps
         world_size = self.get_world_size()
         if effective_batch_size % world_size != 0:
             raise ValueError(
-                f"Effective batch size "
-                "{effective_batch_size} is not divisible "
-                "by the world size {world_size}."
+                f"Effective batch size {effective_batch_size} is not divisible "
+                f"by the world size {world_size}."
             )
         acc_steps_div = math.gcd(args.acc_steps, world_size)
         args.acc_steps = args.acc_steps // acc_steps_div
         args.batch_size = args.batch_size // (world_size // acc_steps_div)
         args.device = f"cuda:{self.local_rank}"
-        args.seed = args.seed + self.local_rank
+        args.seed = args.seed + self.rank
         args.data_seed = args.data_seed
         return args
 
     def transform_model(self, model):
-        return DDP(model, device_ids=[self.local_rank])
+        # Llama carries opt-specific Newton-Muon stats buffers; ordinary DDP train/eval
+        # does not need to broadcast them on every forward.
+        return DDP(model, device_ids=[self.local_rank], broadcast_buffers=False)
 
     @contextmanager
     def get_context_for_microstep_forward(
@@ -57,6 +83,19 @@ class DataParallelDistributedBackend(DistributedBackend):
 
     def get_world_size(self):
         return get_world_size()
+
+    def barrier(self):
+        distributed_barrier()
+
+    def broadcast_object(self, value, src=0):
+        payload = [value]
+        broadcast_object_list(payload, src=src)
+        return payload[0]
+
+    def all_gather_object(self, value):
+        values = [None] * self.get_world_size()
+        distributed_all_gather_object(values, value)
+        return values
 
     def finalize(self):
         destroy_process_group()

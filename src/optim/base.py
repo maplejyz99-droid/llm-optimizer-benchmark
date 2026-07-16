@@ -1,9 +1,11 @@
 import copy
 import math
+import random
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 
@@ -26,40 +28,261 @@ from .utils import (eval, extend_onecycle_total_steps, get_batch,
                     visualize_routing)
 
 
-def _cuda_memory_enabled(cfg, distributed_backend):
-    return (
-        getattr(cfg, "log_cuda_memory", False)
-        and "cuda" in cfg.device
-        and torch.cuda.is_available()
-        and distributed_backend.is_master_process()
-    )
-
-
-def _should_log_cuda_memory(cfg, curr_iter):
-    interval = max(1, int(getattr(cfg, "cuda_memory_log_interval", 1)))
-    return curr_iter < 3 or curr_iter % interval == 0
-
-
-def _reset_cuda_memory_peak(cfg):
-    if "cuda" in cfg.device and torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-
-def _log_cuda_memory(cfg, distributed_backend, curr_iter, tag):
-    if not _cuda_memory_enabled(cfg, distributed_backend):
+def _distributed_barrier(distributed_backend):
+    barrier = getattr(distributed_backend, "barrier", None)
+    if barrier is not None:
+        barrier()
         return
-    if not _should_log_cuda_memory(cfg, curr_iter):
-        return
-    torch.cuda.synchronize()
-    gib = 1024**3
-    print(
-        f"[mem][iter={curr_iter}][{tag}] "
-        f"curr_alloc_GiB={torch.cuda.memory_allocated() / gib:.3f} "
-        f"curr_resv_GiB={torch.cuda.memory_reserved() / gib:.3f} "
-        f"max_alloc_GiB={torch.cuda.max_memory_allocated() / gib:.3f} "
-        f"max_resv_GiB={torch.cuda.max_memory_reserved() / gib:.3f}",
-        flush=True,
+    if distributed_backend.get_world_size() != 1:
+        raise RuntimeError("Distributed backend does not provide barrier().")
+
+def _broadcast_object(distributed_backend, value, src=0):
+    broadcast = getattr(distributed_backend, "broadcast_object", None)
+    if broadcast is not None:
+        return broadcast(value, src=src)
+    if distributed_backend.get_world_size() == 1:
+        return value
+    raise RuntimeError("Distributed backend does not provide broadcast_object().")
+
+
+def _all_gather_object(distributed_backend, value):
+    all_gather = getattr(distributed_backend, "all_gather_object", None)
+    if all_gather is not None:
+        return all_gather(value)
+    if distributed_backend.get_world_size() == 1:
+        return [value]
+    raise RuntimeError("Distributed backend does not provide all_gather_object().")
+
+
+def _run_synchronized_action(
+    distributed_backend,
+    action_name,
+    action,
+    *,
+    master_only=False,
+):
+    """Run an action and make every rank fail before entering a new collective."""
+    local_exception = None
+    result = None
+    if not master_only or distributed_backend.is_master_process():
+        try:
+            result = action()
+        except BaseException as exc:
+            local_exception = exc
+
+    failure = None
+    if local_exception is not None:
+        failure = {
+            "rank": int(getattr(distributed_backend, "rank", 0)),
+            "type": type(local_exception).__name__,
+            "message": str(local_exception),
+        }
+    failures = [
+        item
+        for item in _all_gather_object(distributed_backend, failure)
+        if item is not None
+    ]
+    if failures:
+        if local_exception is not None:
+            raise local_exception
+        first = failures[0]
+        raise RuntimeError(
+            f"{action_name} failed on rank {first['rank']}: "
+            f"{first['type']}: {first['message']}"
+        )
+    return result
+
+
+@contextmanager
+def _preserve_rng_state():
+    """Keep evaluation and text generation from changing training RNG streams."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    random_module = getattr(torch, "random", None)
+    get_cpu_state = getattr(random_module, "get_rng_state", None)
+    set_cpu_state = getattr(random_module, "set_rng_state", None)
+    cpu_state = get_cpu_state() if get_cpu_state is not None else None
+
+    cuda_module = getattr(torch, "cuda", None)
+    cuda_available = (
+        cuda_module is not None
+        and hasattr(cuda_module, "is_available")
+        and cuda_module.is_available()
     )
+    get_cuda_states = getattr(cuda_module, "get_rng_state_all", None)
+    set_cuda_states = getattr(cuda_module, "set_rng_state_all", None)
+    cuda_states = (
+        get_cuda_states()
+        if cuda_available and get_cuda_states is not None
+        else None
+    )
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        if cpu_state is not None and set_cpu_state is not None:
+            set_cpu_state(cpu_state)
+        if cuda_states is not None and set_cuda_states is not None:
+            set_cuda_states(cuda_states)
+
+
+def _reader_step(train_reader, fallback):
+    return int(getattr(train_reader, "step", fallback))
+
+
+def _save_checkpoint_at(
+    model,
+    opt,
+    scheduler,
+    curr_iter,
+    ckpt_dir,
+    distributed_backend,
+    cfg,
+    train_reader,
+    substep,
+    averagers,
+):
+    def build_training_state():
+        reader_step = _reader_step(train_reader, substep)
+        if reader_step != substep:
+            raise RuntimeError(
+                "Training reader step diverged from substep before checkpoint: "
+                f"reader={reader_step}, substep={substep}."
+            )
+        return {
+            "iteration": int(curr_iter),
+            "train_reader_step": reader_step,
+            "substep": int(substep),
+        }
+
+    training_state = _run_synchronized_action(
+        distributed_backend,
+        "checkpoint preparation",
+        build_training_state,
+    )
+    world_size = distributed_backend.get_world_size()
+    rank = getattr(distributed_backend, "rank", 0)
+
+    def save_main_checkpoint():
+        return save_checkpoint(
+            model,
+            opt,
+            scheduler,
+            curr_iter,
+            ckpt_dir,
+            training_state=training_state,
+            run_identity=getattr(cfg, "run_identity", None),
+            world_size=world_size,
+            averagers=averagers or None,
+        )
+
+    snapshot_id = _run_synchronized_action(
+        distributed_backend,
+        "main checkpoint save",
+        save_main_checkpoint,
+        master_only=True,
+    )
+    snapshot_id = _broadcast_object(
+        distributed_backend,
+        snapshot_id,
+        src=0,
+    )
+    _distributed_barrier(distributed_backend)
+
+    _run_synchronized_action(
+        distributed_backend,
+        "worker checkpoint save",
+        lambda: save_worker_state(
+            ckpt_dir,
+            opt=opt,
+            training_state=training_state,
+            world_size=world_size,
+            rank=rank,
+            snapshot_id=snapshot_id,
+        ),
+    )
+    _distributed_barrier(distributed_backend)
+
+
+def _resume_training_state(
+    model,
+    opt,
+    scheduler,
+    cfg,
+    averagers,
+    expected_world_size,
+    rank,
+    use_gn,
+):
+    if not cfg.resume_from:
+        return 0, 0
+
+    print(f"\nResuming Training From {cfg.resume_from}")
+    ckpt_dir = Path(cfg.resume_from)
+    allow_legacy = getattr(cfg, "allow_legacy_checkpoint_resume", False)
+    checkpoint = load_checkpoint(
+        model,
+        opt,
+        scheduler,
+        ckpt_dir / "main.pt",
+        cfg.device,
+        averagers=averagers or None,
+        expected_run_identity=getattr(cfg, "run_identity", None),
+        expected_world_size=expected_world_size,
+        allow_legacy=allow_legacy,
+        return_metadata=True,
+    )
+    worker_training_state = load_worker_state(
+        ckpt_dir,
+        opt=opt,
+        rank=rank,
+        expected_world_size=expected_world_size,
+        expected_snapshot_id=checkpoint.snapshot_id,
+        allow_legacy=allow_legacy,
+    )
+    extend_onecycle_total_steps(scheduler, cfg.iterations)
+
+    curr_iter = int(checkpoint.iteration)
+    if checkpoint.format_version == 0:
+        if use_gn:
+            raise RuntimeError(
+                "GN cannot resume from a legacy checkpoint because its exact "
+                "training reader position was not recorded."
+            )
+        return curr_iter, curr_iter * cfg.acc_steps
+
+    training_state = checkpoint.training_state
+    try:
+        saved_iteration = int(training_state["iteration"])
+        reader_step = int(training_state["train_reader_step"])
+        substep = int(training_state["substep"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Checkpoint training_state must contain integer iteration, "
+            "train_reader_step, and substep values."
+        ) from exc
+    if saved_iteration != curr_iter:
+        raise RuntimeError(
+            "Checkpoint training_state iteration does not match checkpoint "
+            f"iteration: {saved_iteration} != {curr_iter}."
+        )
+    if reader_step < 0 or substep < 0:
+        raise RuntimeError("Checkpoint reader position cannot be negative.")
+    if reader_step != substep:
+        raise RuntimeError(
+            "Checkpoint train_reader_step does not match substep: "
+            f"{reader_step} != {substep}."
+        )
+    if worker_training_state:
+        for key in ("iteration", "train_reader_step", "substep"):
+            if key in worker_training_state and int(worker_training_state[key]) != int(
+                training_state[key]
+            ):
+                raise RuntimeError(
+                    f"Worker checkpoint {key} does not match main checkpoint."
+                )
+    return curr_iter, reader_step
 
 
 def train(
@@ -71,6 +294,20 @@ def train(
     distributed_backend,
     cfg,
 ):
+    use_gn = cfg.opt in {"gn-prox", "gn-full"}
+    active_world_size = distributed_backend.get_world_size()
+    expected_world_size = getattr(cfg, "world_size", active_world_size)
+    if int(expected_world_size) != int(active_world_size):
+        raise RuntimeError(
+            "Configured checkpoint world size does not match the active backend: "
+            f"expected={expected_world_size}, active={active_world_size}."
+        )
+    if use_gn and active_world_size > 1:
+        raise RuntimeError(
+            "Benchmark GN is currently single-rank only; its manually assigned "
+            "gradients do not have verified DDP synchronization semantics."
+        )
+
     not_compiled_model = model
     if cfg.compile:
         print(f"Compiling model ...")
@@ -88,29 +325,8 @@ def train(
     else:
         type_ctx = nullcontext()
 
-    if cfg.resume_from:
-        # This is a full resume including the model weights, optimizer, state
-        # dataloader state, random seed, etc. Not indended for fine tuning or
-        # other scenarios where some of these should change.
-        print(f"\nResuming Training From {cfg.resume_from}")
-        ckpt_dir = Path(cfg.resume_from)
-        curr_iter = load_checkpoint(
-            model,
-            opt,
-            scheduler,
-            ckpt_dir / "main.pt",
-            cfg.device,
-        )
-        load_worker_state(ckpt_dir)
-        extend_onecycle_total_steps(scheduler, cfg.iterations)
-    else:
-        curr_iter = 0
-
+    weight_averager = None
     if cfg.weight_average:
-        # This does generally not support resuming training, but will work if
-        # cfg.wa_interval perfectly divides the iteration number of the chkpt.
-        # Otherwise, the first avg will not be correctly computed, with a bias
-        # towards the first sample and missing values for earlier iterations.
         weight_averager = WeightAverager(
             not_compiled_model,
             horizon=cfg.wa_horizon,
@@ -120,8 +336,9 @@ def train(
                 "float32": torch.float32,
                 "float64": torch.float64,
             }[cfg.wa_dtype],
-            count=curr_iter,
+            count=0,
         )
+    ewa = None
     if cfg.exponential_weight_average:
         ewa = ExponentialWeightAverager(
             not_compiled_model,
@@ -134,6 +351,31 @@ def train(
             }[cfg.wa_dtype],
         )
 
+    averagers = {}
+    if weight_averager is not None:
+        averagers["wa"] = weight_averager
+    if ewa is not None:
+        averagers["ewa"] = ewa
+
+    resume_args = (
+        model,
+        opt,
+        scheduler,
+        cfg,
+        averagers,
+        expected_world_size,
+        getattr(distributed_backend, "rank", 0),
+        use_gn,
+    )
+    if cfg.resume_from:
+        curr_iter, substep = _run_synchronized_action(
+            distributed_backend,
+            "checkpoint restore",
+            lambda: _resume_training_state(*resume_args),
+        )
+    else:
+        curr_iter, substep = _resume_training_state(*resume_args)
+
     if distributed_backend.is_master_process() and cfg.log_dynamics:
         with open(cfg.dynamics_logger_cfg, "r") as f:
             dlcfg = yaml.safe_load(f)
@@ -144,10 +386,27 @@ def train(
         )
         dlogger.iteration = curr_iter
 
-    substep = curr_iter * cfg.acc_steps
     train_reader, val_reader = datareaders["train"], datareaders["val"]
     train_reader.set_step(substep)
-    stats = {"train_loss": [], "val_loss": [], "val_pp": [], "val_acc": []}
+    metric_semantics = copy.deepcopy(
+        getattr(
+            cfg,
+            "metric_semantics",
+            {
+                "validation_loss": "next_token_cross_entropy",
+                "validation_accuracy": "next_token_accuracy",
+            },
+        )
+    )
+    stats = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_pp": [],
+        "val_acc": [],
+        "train_records": [],
+        "validation_records": [],
+        "metric_semantics": metric_semantics,
+    }
     last_train_loss = None
     last_iter_dt = None
     last_lr = None
@@ -155,25 +414,44 @@ def train(
     last_val_pp = None
     last_val_acc = None
     grad_norms = []
+    wall_clock_start = time.perf_counter()
+    train_step_seconds_total = 0.0
+    completed_iterations = 0
     model.train()
-    use_gn = cfg.opt in {"gn-prox", "gn-full"}
-
     while curr_iter <= cfg.iterations:
         # Save permanent checkpoint
         if cfg.permanent_ckpt_interval > 0:
             if curr_iter % cfg.permanent_ckpt_interval == 0:
                 ckpt_dir = exp_dir / "ckpts" / str(curr_iter)
-                if distributed_backend.is_master_process():
-                    save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir)
-                save_worker_state(ckpt_dir)
+                _save_checkpoint_at(
+                    model,
+                    opt,
+                    scheduler,
+                    curr_iter,
+                    ckpt_dir,
+                    distributed_backend,
+                    cfg,
+                    train_reader,
+                    substep,
+                    averagers,
+                )
 
         # Save temporary checkpoint for resuming training
         if cfg.latest_ckpt_interval > 0:
             if curr_iter % cfg.latest_ckpt_interval == 0 or curr_iter == cfg.iterations:
                 ckpt_dir = exp_dir / "ckpts" / "latest"
-                if distributed_backend.is_master_process():
-                    save_checkpoint(model, opt, scheduler, curr_iter, ckpt_dir)
-                save_worker_state(ckpt_dir)
+                _save_checkpoint_at(
+                    model,
+                    opt,
+                    scheduler,
+                    curr_iter,
+                    ckpt_dir,
+                    distributed_backend,
+                    cfg,
+                    train_reader,
+                    substep,
+                    averagers,
+                )
 
         ws = distributed_backend.get_world_size()
         tokens = ws * substep * cfg.sequence_length * cfg.batch_size
@@ -183,46 +461,75 @@ def train(
             or curr_iter == cfg.iterations
             or (curr_iter in cfg.full_eval_at)
         ):
-            (
-                last_val_loss,
-                last_val_pp,
-                last_val_acc,
-            ) = eval_and_log(
-                tokens,
-                curr_iter,
-                epoch,
-                model,
-                val_reader,
-                type_ctx,
-                distributed_backend,
-                cfg,
-                opt,
-                full_eval=(curr_iter in cfg.full_eval_at),
-            )
-
-            if curr_iter > cfg.wa_interval and cfg.weight_average:
-                eval_wa(
+            def run_evaluations():
+                result = eval_and_log(
+                    tokens,
                     curr_iter,
-                    not_compiled_model,
-                    weight_averager,
+                    epoch,
+                    model,
                     val_reader,
                     type_ctx,
                     distributed_backend,
                     cfg,
+                    opt,
                     full_eval=(curr_iter in cfg.full_eval_at),
                 )
 
-            if cfg.exponential_weight_average:
-                eval_ewa(
-                    curr_iter,
-                    not_compiled_model,
-                    ewa,
-                    val_reader,
-                    type_ctx,
+                if curr_iter > cfg.wa_interval and cfg.weight_average:
+                    eval_wa(
+                        curr_iter,
+                        not_compiled_model,
+                        weight_averager,
+                        val_reader,
+                        type_ctx,
+                        distributed_backend,
+                        cfg,
+                        full_eval=(curr_iter in cfg.full_eval_at),
+                    )
+
+                if cfg.exponential_weight_average:
+                    eval_ewa(
+                        curr_iter,
+                        not_compiled_model,
+                        ewa,
+                        val_reader,
+                        type_ctx,
+                        distributed_backend,
+                        cfg,
+                        full_eval=(curr_iter in cfg.full_eval_at),
+                    )
+                return result
+
+            with _preserve_rng_state():
+                evaluation_result = _run_synchronized_action(
                     distributed_backend,
-                    cfg,
-                    full_eval=(curr_iter in cfg.full_eval_at),
+                    "evaluation",
+                    run_evaluations,
+                    master_only=True,
                 )
+            if evaluation_result is None:
+                last_val_loss = last_val_pp = last_val_acc = None
+            else:
+                (
+                    last_val_loss,
+                    last_val_pp,
+                    last_val_acc,
+                ) = evaluation_result
+
+            if last_val_loss is not None:
+                stats["val_loss"].append(float(last_val_loss))
+                stats["val_pp"].append(float(last_val_pp))
+                stats["val_acc"].append(float(last_val_acc))
+                stats["validation_records"].append(
+                    {
+                        "iteration": int(curr_iter),
+                        "tokens": int(tokens),
+                        "loss": float(last_val_loss),
+                        "perplexity": float(last_val_pp),
+                        "token_accuracy": float(last_val_acc),
+                    }
+                )
+            _distributed_barrier(distributed_backend)
 
         if curr_iter == cfg.iterations:
             # Save checkpoints and evaluate at final iteration, but no need to train further
@@ -231,11 +538,6 @@ def train(
         # Train model
         t_start = time.perf_counter_ns()
         gn_step_size = None
-        if _cuda_memory_enabled(cfg, distributed_backend) and _should_log_cuda_memory(
-            cfg, curr_iter
-        ):
-            _reset_cuda_memory_peak(cfg)
-            _log_cuda_memory(cfg, distributed_backend, curr_iter, "iter_start")
         if use_gn:
             raw_model = distributed_backend.get_raw_model(model)
             gn_mode = "full" if cfg.opt == "gn-full" else "prox"
@@ -325,11 +627,6 @@ def train(
             )
             for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
                 x, y = get_batch(train_reader, device=cfg.device)
-                if (
-                    _cuda_memory_enabled(cfg, distributed_backend)
-                    and _should_log_cuda_memory(cfg, curr_iter)
-                ):
-                    _reset_cuda_memory_peak(cfg)
                 with type_ctx:
                     with distributed_backend.get_context_for_microstep_forward(
                         model=model,
@@ -345,26 +642,9 @@ def train(
                             )
                         else:
                             outputs = model(x, targets=y, moe=cfg.moe)
-                _log_cuda_memory(
-                    cfg,
-                    distributed_backend,
-                    curr_iter,
-                    f"micro={microstep_idx}/after_forward",
-                )
 
                 loss = outputs["loss"] / cfg.acc_steps
-                if (
-                    _cuda_memory_enabled(cfg, distributed_backend)
-                    and _should_log_cuda_memory(cfg, curr_iter)
-                ):
-                    _reset_cuda_memory_peak(cfg)
                 loss.backward()
-                _log_cuda_memory(
-                    cfg,
-                    distributed_backend,
-                    curr_iter,
-                    f"micro={microstep_idx}/after_backward",
-                )
                 substep += 1
 
             if cfg.grad_clip != 0.0:
@@ -380,26 +660,14 @@ def train(
 
             if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
                 opt.train()
-            if _cuda_memory_enabled(cfg, distributed_backend) and _should_log_cuda_memory(
-                cfg, curr_iter
-            ):
-                _reset_cuda_memory_peak(cfg)
             (
                 opt.step()
                 if cfg.opt != "sophiag"
                 else opt.step(bs=cfg.sophia_bs * cfg.sequence_length)
             )
-            _log_cuda_memory(
-                cfg, distributed_backend, curr_iter, "after_step_before_zero_grad"
-            )
             if cfg.scheduler != "none":
                 scheduler.step()
             if cfg.opt == "sophiag":
-                if (
-                    _cuda_memory_enabled(cfg, distributed_backend)
-                    and _should_log_cuda_memory(cfg, curr_iter)
-                ):
-                    _reset_cuda_memory_peak(cfg)
                 opt.zero_grad(set_to_none=True)
                 if curr_iter % cfg.precondition_frequency == cfg.precondition_frequency - 1:
                     sample_again = model(x, targets=y, get_logits=True)
@@ -416,24 +684,11 @@ def train(
                     opt.update_hessian()
                     opt.zero_grad(set_to_none=True)
                     model.zero_grad()
-                _log_cuda_memory(cfg, distributed_backend, curr_iter, "after_zero_grad")
             elif cfg.opt == "mars":
-                if (
-                    _cuda_memory_enabled(cfg, distributed_backend)
-                    and _should_log_cuda_memory(cfg, curr_iter)
-                ):
-                    _reset_cuda_memory_peak(cfg)
                 opt.zero_grad(set_to_none=True)
                 opt.update_last_grad()
-                _log_cuda_memory(cfg, distributed_backend, curr_iter, "after_zero_grad")
             else:
-                if (
-                    _cuda_memory_enabled(cfg, distributed_backend)
-                    and _should_log_cuda_memory(cfg, curr_iter)
-                ):
-                    _reset_cuda_memory_peak(cfg)
                 opt.zero_grad(set_to_none=True)
-                _log_cuda_memory(cfg, distributed_backend, curr_iter, "after_zero_grad")
 
         if cfg.scheduler != "none" and use_gn:
             scheduler.step()
@@ -448,7 +703,25 @@ def train(
         dt = (time.perf_counter_ns() - t_start) / 1e9
 
         curr_iter += 1
+        completed_iterations += 1
+        train_step_seconds_total += dt
+        elapsed_seconds = time.perf_counter() - wall_clock_start
+        avg_iter_dt = train_step_seconds_total / max(1, completed_iterations)
         last_iter_dt = dt
+
+        train_loss_value = loss.detach().cpu().item()
+        if not use_gn:
+            train_loss_value *= cfg.acc_steps
+        stats["train_loss"].append(float(train_loss_value))
+        stats["train_records"].append(
+            {
+                "iteration": int(curr_iter),
+                "tokens": int(
+                    ws * substep * cfg.sequence_length * cfg.batch_size
+                ),
+                "loss": float(train_loss_value),
+            }
+        )
 
         if (
             cfg.log_interval
@@ -472,6 +745,9 @@ def train(
             print(
                 f"Train: Iter={curr_iter} ({epoch:0.3f} epochs) "
                 f"train_loss={train_loss:.3f} iter_dt={dt:.2e}s "
+                f"elapsed={elapsed_seconds:.2f}s "
+                f"train_step_total={train_step_seconds_total:.2f}s "
+                f"avg_iter_dt={avg_iter_dt:.2e}s "
                 f"lr={current_lrs[0]:.2e}"
             )
             if cfg.opt == "prodigy":
@@ -485,6 +761,10 @@ def train(
                     "train/perplexity": 2.71828**train_loss,
                     "lr": current_lrs[0],
                     "iter_dt": dt,
+                    "wall_clock/elapsed_seconds": elapsed_seconds,
+                    "train/step_seconds": dt,
+                    "train/step_seconds_total": train_step_seconds_total,
+                    "train/avg_step_seconds": avg_iter_dt,
                     "max_grad_norm": max(grad_norms).item() if grad_norms else 0,
                     "mean_grad_norm": (
                         torch.tensor(grad_norms).mean().item() if grad_norms else 0
@@ -521,7 +801,26 @@ def train(
                 run_name=exp_dir.name,
             )
 
+    stats["wall_clock_seconds"] = time.perf_counter() - wall_clock_start
+    stats["train_step_seconds_total"] = train_step_seconds_total
+    stats["avg_iter_dt"] = (
+        train_step_seconds_total / completed_iterations
+        if completed_iterations
+        else 0.0
+    )
+    stats["completed_iterations"] = completed_iterations
     return stats
+
+
+def _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval):
+    if curr_iter != cfg.iterations and not full_eval:
+        return cfg.eval_batches
+
+    available_batches = val_reader.num_batches()
+    final_eval_batches = getattr(cfg, "final_eval_batches", None)
+    if final_eval_batches is None:
+        return available_batches
+    return min(available_batches, final_eval_batches)
 
 
 def eval_and_log(
@@ -541,19 +840,17 @@ def eval_and_log(
         return None, None, None
 
     model.eval()
+    eval_model = distributed_backend.get_raw_model(model)
     if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
         opt.eval()
 
-    if curr_iter == cfg.iterations or full_eval:
-        max_num_batches = val_reader.num_batches()
-    else:
-        max_num_batches = cfg.eval_batches
+    max_num_batches = _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval)
 
     # to make sure we start from the beginning of the validation set,
     # i.e. repeat the same batches
     val_reader.set_step(0)
     val_acc, val_loss, val_perplexity, val_aux_losses, router_logits = eval(
-        model,
+        eval_model,
         val_reader,
         cfg.device,
         max_num_batches=max_num_batches,

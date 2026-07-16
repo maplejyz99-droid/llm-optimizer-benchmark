@@ -1,30 +1,15 @@
 #!/usr/bin/env python3
 
 import csv
-import re
 import statistics
 from collections import defaultdict
 from pathlib import Path
 
 
 RUNS = {
-    "muon": {
-        "smi": Path("logs/muon_124m_1gpu_bs32_acc1_500step_smi.csv"),
-        "train": Path("logs/muon_124m_1gpu_bs32_acc1_500step.log"),
-    },
-    "newton-muon": {
-        "smi": Path("logs/newton_muon_124m_1gpu_bs32_acc1_500step_smi.csv"),
-        "train": Path("logs/newton_muon_124m_1gpu_bs32_acc1_500step.log"),
-    },
+    "muon": Path("logs/muon_124m_1gpu_bs32_acc1_500step_smi.csv"),
+    "newton-muon": Path("logs/newton_muon_124m_1gpu_bs32_acc1_500step_smi.csv"),
 }
-
-MEM_RE = re.compile(
-    r"^\[mem\]\[iter=(?P<iter>\d+)\]\[(?P<tag>[^\]]+)\] "
-    r"curr_alloc_GiB=(?P<curr_alloc>[0-9.]+) "
-    r"curr_resv_GiB=(?P<curr_resv>[0-9.]+) "
-    r"max_alloc_GiB=(?P<max_alloc>[0-9.]+) "
-    r"max_resv_GiB=(?P<max_resv>[0-9.]+)"
-)
 
 
 def load_series(path):
@@ -51,51 +36,16 @@ def load_series(path):
     }
 
 
-def load_torch_memory(path):
-    by_tag = defaultdict(list)
-
-    with path.open() as f:
-        for line in f:
-            match = MEM_RE.match(line.strip())
-            if not match:
-                continue
-            item = {
-                "iter": int(match.group("iter")),
-                "curr_alloc": float(match.group("curr_alloc")),
-                "curr_resv": float(match.group("curr_resv")),
-                "max_alloc": float(match.group("max_alloc")),
-                "max_resv": float(match.group("max_resv")),
-            }
-            by_tag[match.group("tag")].append(item)
-
-    summary = {}
-    for tag, rows in by_tag.items():
-        summary[tag] = {
-            "samples": len(rows),
-            "peak_max_alloc": max(row["max_alloc"] for row in rows),
-            "peak_max_resv": max(row["max_resv"] for row in rows),
-            "median_curr_alloc": statistics.median(row["curr_alloc"] for row in rows),
-            "median_curr_resv": statistics.median(row["curr_resv"] for row in rows),
-        }
-    return summary
-
-
 def main():
     rows = {}
-    torch_rows = {}
-    for name, paths in RUNS.items():
-        path = paths["smi"]
+    for name, path in RUNS.items():
         if not path.exists():
             raise SystemExit(f"Missing {path}. Run the {name} probe first.")
         rows[name] = load_series(path)
-        train_path = paths["train"]
-        torch_rows[name] = load_torch_memory(train_path) if train_path.exists() else {}
 
     muon = rows["muon"]
     newton = rows["newton-muon"]
 
-    print("## nvidia-smi process memory")
-    print()
     print("| run | peak MiB | steady median MiB | samples | process names |")
     print("|---|---:|---:|---:|---|")
     for name in ("muon", "newton-muon"):
@@ -121,27 +71,6 @@ def main():
             print(
                 "Newton-Muon peak is at least 10% above its steady median; "
                 "inspect refresh-step windows around iterations 32, 64, 96, ... 480."
-            )
-
-    if torch_rows["muon"] and torch_rows["newton-muon"]:
-        print()
-        print("## torch cuda memory by training phase")
-        print()
-        print(
-            "| tag | muon max alloc GiB | newton max alloc GiB | delta alloc GiB | "
-            "muon max reserved GiB | newton max reserved GiB | delta reserved GiB |"
-        )
-        print("|---|---:|---:|---:|---:|---:|---:|")
-        common_tags = sorted(set(torch_rows["muon"]) & set(torch_rows["newton-muon"]))
-        for tag in common_tags:
-            mu = torch_rows["muon"][tag]
-            nm = torch_rows["newton-muon"][tag]
-            print(
-                f"| {tag} | "
-                f"{mu['peak_max_alloc']:.3f} | {nm['peak_max_alloc']:.3f} | "
-                f"{nm['peak_max_alloc'] - mu['peak_max_alloc']:.3f} | "
-                f"{mu['peak_max_resv']:.3f} | {nm['peak_max_resv']:.3f} | "
-                f"{nm['peak_max_resv'] - mu['peak_max_resv']:.3f} |"
             )
 
 

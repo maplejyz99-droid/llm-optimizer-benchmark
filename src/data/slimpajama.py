@@ -64,13 +64,16 @@ def get_slimpajama_data(datasets_dir, num_proc=40):
 
 
 def get_slimpajama_chunk1(datasets_dir, num_proc=40):
-    SPJ_DATA_PATH = os.path.join(datasets_dir, "slimpajama6B/")
-    SPJ_CHUNK_1_DATA_PATH = os.path.join(SPJ_DATA_PATH, "chunk1")
+    SPJ_CHUNK_1_DATA_PATH = os.path.join(datasets_dir, "slimpajama627B", "chunk1")
     if not os.path.exists(os.path.join(SPJ_CHUNK_1_DATA_PATH, "train.bin")):
-        os.makedirs(SPJ_DATA_PATH, exist_ok=True)
-        dataset = load_dataset("cerebras/SlimPajama-627B", split="train/chunk1")
+        os.makedirs(SPJ_CHUNK_1_DATA_PATH, exist_ok=True)
+        dataset = load_dataset(
+            "cerebras/SlimPajama-627B",
+            data_dir="train/chunk1",
+            split="train",
+        )
 
-        split_dataset = dataset["train"].train_test_split(
+        split_dataset = dataset.train_test_split(
             test_size=0.0005, seed=2357, shuffle=True
         )
         split_dataset["val"] = split_dataset.pop("test")
@@ -96,7 +99,7 @@ def get_slimpajama_chunk1(datasets_dir, num_proc=40):
         # concatenate all the ids in each dataset into one large file we can use for training
         for split, dset in tokenized.items():
             arr_len = np.sum(dset["len"])
-            filename = os.path.join(SPJ_DATA_PATH, f"{split}.bin")
+            filename = os.path.join(SPJ_CHUNK_1_DATA_PATH, f"{split}.bin")
             dtype = np.uint16  # (can do since enc.max_token_value == 50256 is < 2**16)
             arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
             total_batches = min(1024, len(dset))
@@ -114,6 +117,6 @@ def get_slimpajama_chunk1(datasets_dir, num_proc=40):
             arr.flush()
 
     return {
-        "train": os.path.join(SPJ_DATA_PATH, "train.bin"),
-        "val": os.path.join(SPJ_DATA_PATH, "val.bin"),
+        "train": os.path.join(SPJ_CHUNK_1_DATA_PATH, "train.bin"),
+        "val": os.path.join(SPJ_CHUNK_1_DATA_PATH, "val.bin"),
     }

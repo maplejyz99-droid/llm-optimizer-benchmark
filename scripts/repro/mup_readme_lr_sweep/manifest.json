@@ -1,0 +1,151 @@
+{
+  "experiment_prefix": "mup_readme_lr",
+  "results_base_folder": "exps/mup_readme_lr_sweep",
+  "log_root": "logs/mup_readme_lr_sweep",
+  "seed": 0,
+  "models": [
+    {"alias": "sp", "model": "llama"},
+    {"alias": "mup", "model": "mup_llama"}
+  ],
+  "widths": [
+    {"n_embd": 128, "n_head": 2},
+    {"n_embd": 256, "n_head": 4},
+    {"n_embd": 512, "n_head": 8},
+    {"n_embd": 768, "n_head": 12}
+  ],
+  "base_args": {
+    "config_format": "base",
+    "n_layer": 4,
+    "batch_size": 16,
+    "sequence_length": 256,
+    "acc_steps": 1,
+    "dataset": "slimpajama",
+    "dropout": 0.0,
+    "grad_clip": 0.5,
+    "opt": "adamw",
+    "weight_decay": 0.1,
+    "scheduler": "cos",
+    "beta1": 0.8,
+    "beta2": 0.999,
+    "scale_base_model": 256,
+    "scale_emb": 10,
+    "scale_depth": 1.4,
+    "latest_ckpt_interval": 0,
+    "eval_interval": 250,
+    "log_interval": 10
+  },
+  "calibrate": {
+    "model_alias": "mup",
+    "n_embd": 768,
+    "lr": 0.001,
+    "iterations": 50,
+    "warmup_steps": 5
+  },
+  "coarse": {
+    "lrs": [0.0003, 0.001, 0.003],
+    "iterations": 500,
+    "warmup_steps": 50
+  },
+  "fine": {
+    "iterations": 500,
+    "warmup_steps": 50
+  },
+  "long": {
+    "iterations": 5000,
+    "warmup_steps": 500
+  },
+  "v2": {
+    "results_csv": "logs/mup_readme_lr_sweep/results_v2.csv",
+    "probe_summary_csv": "logs/mup_readme_lr_sweep/probe_summary.csv",
+    "probe_widths": [
+      {"n_embd": 768, "n_head": 12},
+      {"n_embd": 1024, "n_head": 16},
+      {"n_embd": 1536, "n_head": 24},
+      {"n_embd": 2048, "n_head": 32},
+      {"n_embd": 3072, "n_head": 48}
+    ],
+    "base_args": {
+      "config_format": "base",
+      "n_layer": 12,
+      "batch_size": 64,
+      "sequence_length": 512,
+      "acc_steps": 1,
+      "dataset": "slimpajama",
+      "dropout": 0.0,
+      "grad_clip": 0.5,
+      "opt": "adamw",
+      "weight_decay": 0.1,
+      "scheduler": "cos",
+      "beta1": 0.8,
+      "beta2": 0.999,
+      "scale_base_model": 256,
+      "scale_emb": 10,
+      "scale_depth": 1.4,
+      "latest_ckpt_interval": 0,
+      "eval_interval": 500,
+      "log_interval": 20
+    },
+    "probe": {
+      "lr": 0.001,
+      "iterations": 30,
+      "warmup_steps": 3
+    },
+    "sweep": {
+      "lrs": [0.0003, 0.0005, 0.0007, 0.001, 0.0015, 0.002, 0.003, 0.0045, 0.006, 0.01],
+      "iterations": 1000,
+      "warmup_steps": 100
+    },
+    "long": {
+      "iterations": 5000,
+      "warmup_steps": 500
+    }
+  },
+  "v2_l4": {
+    "results_csv": "logs/mup_readme_lr_sweep/results_v2_l4.csv",
+    "probe_summary_csv": "logs/mup_readme_lr_sweep/probe_summary_v2_l4.csv",
+    "probe_widths": [
+      {"n_embd": 128, "n_head": 2},
+      {"n_embd": 256, "n_head": 4},
+      {"n_embd": 512, "n_head": 8},
+      {"n_embd": 768, "n_head": 12},
+      {"n_embd": 1024, "n_head": 16},
+      {"n_embd": 1536, "n_head": 24},
+      {"n_embd": 2048, "n_head": 32}
+    ],
+    "base_args": {
+      "config_format": "base",
+      "n_layer": 4,
+      "batch_size": 64,
+      "sequence_length": 512,
+      "acc_steps": 1,
+      "dataset": "slimpajama",
+      "dropout": 0.0,
+      "grad_clip": 0.5,
+      "opt": "adamw",
+      "weight_decay": 0.1,
+      "scheduler": "cos",
+      "beta1": 0.8,
+      "beta2": 0.999,
+      "scale_base_model": 256,
+      "scale_emb": 10,
+      "scale_depth": 1.4,
+      "latest_ckpt_interval": 0,
+      "eval_interval": 500,
+      "log_interval": 20
+    },
+    "probe": {
+      "lr": 0.001,
+      "iterations": 30,
+      "warmup_steps": 3
+    },
+    "sweep": {
+      "lrs": [0.0001, 0.0002, 0.0003, 0.0005, 0.0007, 0.001, 0.0015, 0.002, 0.003, 0.0045, 0.006, 0.01],
+      "iterations": 1000,
+      "warmup_steps": 100
+    },
+    "long": {
+      "iterations": 5000,
+      "warmup_steps": 500
+    }
+  }
+}

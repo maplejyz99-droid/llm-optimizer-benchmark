@@ -26,5 +26,16 @@ class SinlgeNodeBackend(DistributedBackend):
     def get_world_size(self):
         return 1
 
+    def barrier(self):
+        pass
+
+    def broadcast_object(self, value, src=0):
+        if src != 0:
+            raise ValueError("single-node backend only has rank 0")
+        return value
+
+    def all_gather_object(self, value):
+        return [value]
+
     def translate_model_parameter_name_for_node(self, parameter_name):
         return [parameter_name]

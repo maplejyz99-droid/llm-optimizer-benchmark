@@ -1,3 +1,5 @@
+import argparse
+
 import distributed
 
 
@@ -5,6 +7,38 @@ def none_or_str(value):
     if value == "None":
         return None
     return value
+
+
+def strict_bool(value):
+    """Parse the explicit True/False form used by benchmark scripts."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise argparse.ArgumentTypeError("expected 'True' or 'False'")
+
+def positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
+def validate_supported_args(args):
+    """Reject legacy options that are parsed but have no runtime consumer."""
+    if args.resume_from_swa is not None:
+        raise ValueError("--resume_from_swa is not implemented; use --resume_from")
+    if args.clipping_type != "no":
+        raise ValueError("--clipping_type only supports the default value 'no'")
+    if args.clip_eta != 1.0:
+        raise ValueError("--clip_eta is not implemented and must remain 1.0")
+    if args.n_kv_head is not None:
+        raise ValueError("--n_kv_head is not implemented by the current models")
+    return args
 
 
 def parse_args(base_parser, args, namespace):
@@ -18,6 +52,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--eval_interval", default=200, type=int)
     parser.add_argument("--full_eval_at", nargs="+", type=int)
     parser.add_argument("--eval_batches", default=64, type=int)
+    parser.add_argument("--final_eval_batches", default=None, type=positive_int)
     parser.add_argument("--device", default="cuda:0", type=str)
     parser.add_argument(
         "--distributed_backend",
@@ -35,7 +70,10 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--resume_from", default=None, type=str)
     parser.add_argument("--resume_from_swa", default=None, type=str)
 
-    parser.add_argument("--auto_resume", default=True)
+    parser.add_argument("--auto_resume", default=True, type=strict_bool)
+    parser.add_argument(
+        "--allow_legacy_checkpoint_resume", default=False, type=strict_bool
+    )
 
     # logging params (WandB)
     parser.add_argument("--wandb", action="store_true")  # whether to use wandb or not
@@ -50,11 +88,10 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument(
         "--dynamics_logger_cfg", default="./src/logger/rotational_logger.yaml", type=str
     )
+    parser.add_argument("--log_optimizer_groups", action="store_true")
     parser.add_argument("--wandb_entity", default=None, type=none_or_str)
     parser.add_argument("--log_parameter_norms", action="store_true")
     parser.add_argument("--norm_order", default=2)
-    parser.add_argument("--log_cuda_memory", action="store_true")
-    parser.add_argument("--cuda_memory_log_interval", default=1, type=int)
     # Notifications (email/webhook/stdout)
     parser.add_argument("--notify_interval", default=0, type=int)
     parser.add_argument(
@@ -111,6 +148,7 @@ def parse_args(base_parser, args, namespace):
             "sgd",
             "muon",
             "newton-muon",
+            "softeq-k2000-muon",
             "muon-magma",
             "soap",
             "ademamix",
@@ -143,12 +181,12 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--shampoo_beta", default=-1.0, type=float)
     parser.add_argument("--precondition_frequency", default=10, type=int)
     parser.add_argument("--max_precond_dim", default=10000, type=int)
-    parser.add_argument("--merge_dims", default=False, type=bool)
-    parser.add_argument("--precondition_1d", default=False, type=bool)
-    parser.add_argument("--normalize_grads", default=False, type=bool)
+    parser.add_argument("--merge_dims", default=False, type=strict_bool)
+    parser.add_argument("--precondition_1d", default=False, type=strict_bool)
+    parser.add_argument("--normalize_grads", default=False, type=strict_bool)
     parser.add_argument("--soap_data_format", default="channels_first", type=str)
-    parser.add_argument("--correct_bias", default=True, type=bool)
-    parser.add_argument("--nesterov", default=False, type=bool)
+    parser.add_argument("--correct_bias", default=True, type=strict_bool)
+    parser.add_argument("--nesterov", default=False, type=strict_bool)
     parser.add_argument("--muon_ns_steps", default=5, type=int)
     parser.add_argument("--muon_lr_factor", default=1.0, type=float)
     parser.add_argument("--newton_muon_precond_every", default=32, type=int)
@@ -174,10 +212,12 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--weight_lr_power", default=2.0, type=float)
     parser.add_argument("--dampening", default=0.0, type=float)
     parser.add_argument("--prodigy_beta3", default=None, type=float)
-    parser.add_argument("--prodigy_decouple", default=True, type=bool)
-    parser.add_argument("--prodigy_use_bias_correction", default=False, type=bool)
-    parser.add_argument("--prodigy_safeguard_warmup", default=False, type=bool)
-    parser.add_argument("--prodigy_fsdp_in_use", default=False, type=bool)
+    parser.add_argument("--prodigy_decouple", default=True, type=strict_bool)
+    parser.add_argument(
+        "--prodigy_use_bias_correction", default=False, type=strict_bool
+    )
+    parser.add_argument("--prodigy_safeguard_warmup", default=False, type=strict_bool)
+    parser.add_argument("--prodigy_fsdp_in_use", default=False, type=strict_bool)
     parser.add_argument("--sophia_rho", default=0.04, type=float)
     parser.add_argument("--sophia_bs", default=480, type=int)
     parser.add_argument(
@@ -190,13 +230,13 @@ def parse_args(base_parser, args, namespace):
         choices=["mars-adamw", "mars-lion", "mars-shampoo"],
     )
     parser.add_argument("--mars_vr_gamma", default=0.025, type=float)
-    parser.add_argument("--mars_is_approx", default=True, type=float)
+    parser.add_argument("--mars_is_approx", default=True, type=strict_bool)
     parser.add_argument("--mars_lr", default=3e-3, type=float)
     parser.add_argument("--mars_beta1", default=0.95, type=float)
     parser.add_argument("--mars_beta2", default=0.99, type=float)
     parser.add_argument("--adafactor_decay_rate", default=-0.8, type=float)
-    parser.add_argument("--lamb_use_bias_correction", default=False, type=bool)
-    parser.add_argument("--adopt_decouple", default=True, type=bool)
+    parser.add_argument("--lamb_use_bias_correction", default=False, type=strict_bool)
+    parser.add_argument("--adopt_decouple", default=True, type=strict_bool)
     parser.add_argument("--adopt_eps", default=1e-6, type=float)
     parser.add_argument("--scion_lmh_scale", default=10.0, type=float)
     parser.add_argument("--scion_emb_scale", default=1.0, type=float)
@@ -288,9 +328,7 @@ def parse_args(base_parser, args, namespace):
             "medqa",
         ],
     )
-    parser.add_argument(
-        "--tokenizer", default="gpt2", type=str, choices=["gpt2", "mistral"]
-    )
+    parser.add_argument("--tokenizer", default="gpt2", type=str, choices=["gpt2"])
     parser.add_argument("--vocab_size", default=50304, type=int)
     parser.add_argument(
         "--data_in_ram", action="store_true"
@@ -333,7 +371,7 @@ def parse_args(base_parser, args, namespace):
         type=str,
         choices=["float32", "float16", "bfloat16"],
     )
-    parser.add_argument("--bias", default=False, type=bool)
+    parser.add_argument("--bias", default=False, type=strict_bool)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
         "--untied_embeds", action="store_true"
@@ -378,4 +416,8 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument("--scale_base_model", default=256, type=int)
     parser.add_argument("--scale_depth", default=1.4, type=float)
 
-    return parser.parse_args(args, namespace)
+    parsed_args = parser.parse_args(args, namespace)
+    try:
+        return validate_supported_args(parsed_args)
+    except ValueError as exc:
+        parser.error(str(exc))

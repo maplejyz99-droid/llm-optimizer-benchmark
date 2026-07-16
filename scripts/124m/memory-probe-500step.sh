@@ -100,8 +100,6 @@ COMMON_ARGS=(
     --iterations 500
     --eval_interval 1000000
     --log_interval 10
-    --log_cuda_memory
-    --cuda_memory_log_interval 1
     --run_prefix "${RUN_PREFIX}"
 )
 
