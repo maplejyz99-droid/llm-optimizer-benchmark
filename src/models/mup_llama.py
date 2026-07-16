@@ -112,7 +112,7 @@ class LlamaAttention(CausalSelfAttention):
                 k,
                 v,
                 attn_mask=None,
-                dropout_p=self.dropout,
+                dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
                 scale=1 / q.size(-1),  # mup change here!
             )

@@ -9,7 +9,10 @@ try:
 except ImportError:
     wandb = None
 
-from .utils import eval
+from .utils import atomic_torch_save, eval
+
+
+AVERAGER_STATE_VERSION = 1
 
 
 class WeightAverager:
@@ -44,9 +47,7 @@ class WeightAverager:
         self.count = count
         # check if there are any checkpoints saved in the directory and set
         # num_saved to number of checkpoints with name <= count
-        self.num_saved = len(
-            [f for f in self.save_dir.iterdir() if f.is_file() and int(f.stem) <= count]
-        )
+        self.num_saved = len(_saved_average_counts(self.save_dir, count))
 
     @torch.no_grad()
     def step(self, model, is_master_rank=True):
@@ -62,11 +63,55 @@ class WeightAverager:
         self.count += 1
 
         if self.count % self.horizon == 0 and is_master_rank:
-            torch.save(
+            atomic_torch_save(
                 self.module.to().state_dict(),
                 self.save_dir / f"{self.count}.pt",
             )
             self.num_saved += 1
+
+    def state_dict(self):
+        saved_counts = _saved_average_counts(self.save_dir, self.count)
+        if len(saved_counts) != self.num_saved:
+            raise RuntimeError(
+                "Weight-average checkpoint files do not match num_saved: "
+                f"files={saved_counts}, num_saved={self.num_saved}."
+            )
+        return {
+            "averager_kind": "weight-average",
+            "format_version": AVERAGER_STATE_VERSION,
+            "module": deepcopy(self.module.state_dict()),
+            "count": self.count,
+            "num_saved": self.num_saved,
+            "saved_counts": saved_counts,
+            "horizon": self.horizon,
+            "interval": self.interval,
+        }
+
+    def load_state_dict(self, state_dict):
+        state = _validate_averager_state(
+            state_dict,
+            kind="weight-average",
+            expected_config={
+                "horizon": self.horizon,
+                "interval": self.interval,
+            },
+        )
+        map_and_load_state_dict(self.module, state["module"])
+        count = _nonnegative_int(state["count"], "count")
+        num_saved = _nonnegative_int(state["num_saved"], "num_saved")
+        saved_counts = [_nonnegative_int(value, "saved count") for value in state["saved_counts"]]
+        if saved_counts != sorted(set(saved_counts)) or len(saved_counts) != num_saved:
+            raise ValueError(
+                "averager saved_counts must be unique, sorted, and match num_saved."
+            )
+        available_counts = _saved_average_counts(self.save_dir, count)
+        if available_counts != saved_counts:
+            raise ValueError(
+                "weight-average history required for exact resume is missing or "
+                f"incompatible: saved={saved_counts}, available={available_counts}."
+            )
+        self.count = count
+        self.num_saved = num_saved
 
     def get_latest_like(self, model):
         # Return model for latest completed period
@@ -118,6 +163,64 @@ def map_and_load_state_dict(model, state_dict):
         m_val.copy_(s_val.to(device=m_val.device, dtype=m_val.dtype))
 
 
+def _nonnegative_int(value, name):
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"averager {name} must be non-negative, got {value}.")
+    return value
+
+
+def _saved_average_counts(save_dir, maximum_count):
+    counts = []
+    for path in Path(save_dir).glob("*.pt"):
+        try:
+            count = int(path.stem)
+        except ValueError:
+            continue
+        if count <= int(maximum_count):
+            counts.append(count)
+    return sorted(set(counts))
+
+
+def _validate_averager_state(state_dict, *, kind, expected_config):
+    if not isinstance(state_dict, dict):
+        raise TypeError("averager state must be a dictionary.")
+    if state_dict.get("averager_kind") != kind:
+        raise ValueError(
+            f"averager kind mismatch: expected {kind!r}, "
+            f"got {state_dict.get('averager_kind')!r}."
+        )
+    if state_dict.get("format_version") != AVERAGER_STATE_VERSION:
+        raise ValueError(
+            "unsupported averager state format version: "
+            f"{state_dict.get('format_version')!r}."
+        )
+    required = {"module", "count", "num_saved", *expected_config}
+    if kind == "weight-average":
+        required.add("saved_counts")
+    missing = sorted(required.difference(state_dict))
+    if missing:
+        raise ValueError(f"averager state is missing: {', '.join(missing)}.")
+    for name, expected in expected_config.items():
+        if state_dict[name] != expected:
+            raise ValueError(
+                f"averager {name} mismatch: saved={state_dict[name]!r}, "
+                f"expected={expected!r}."
+            )
+    return state_dict
+
+
+def _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval):
+    if curr_iter != cfg.iterations and not full_eval:
+        return cfg.eval_batches
+
+    available_batches = val_reader.num_batches()
+    final_eval_batches = getattr(cfg, "final_eval_batches", None)
+    if final_eval_batches is None:
+        return available_batches
+    return min(available_batches, final_eval_batches)
+
+
 def eval_wa(
     curr_iter,
     model,
@@ -140,10 +243,8 @@ def eval_wa(
             weight_averager.get_latest_like(model).eval(),
             val_reader,
             cfg.device,
-            max_num_batches=(
-                val_reader.num_batches()
-                if curr_iter == cfg.iterations or full_eval
-                else cfg.eval_batches
+            max_num_batches=_get_eval_batch_count(
+                curr_iter, val_reader, cfg, full_eval
             ),
             ctx=type_ctx,
             moe=cfg.moe,
@@ -184,10 +285,8 @@ def eval_wa(
                 avg_model,
                 val_reader,
                 cfg.device,
-                max_num_batches=(
-                    val_reader.num_batches()
-                    if curr_iter == cfg.iterations or full_eval
-                    else cfg.eval_batches
+                max_num_batches=_get_eval_batch_count(
+                    curr_iter, val_reader, cfg, full_eval
                 ),
                 ctx=type_ctx,
                 moe=cfg.moe,
@@ -288,6 +387,32 @@ class ExponentialWeightAverager:
 
         return new_model
 
+    def state_dict(self):
+        return {
+            "averager_kind": "exponential-weight-average",
+            "format_version": AVERAGER_STATE_VERSION,
+            "module": deepcopy(self.module.state_dict()),
+            "count": self.count,
+            "num_saved": self.num_saved,
+            "interval": self.interval,
+            "decay": self.decay,
+            "warmup": self.warmup,
+        }
+
+    def load_state_dict(self, state_dict):
+        state = _validate_averager_state(
+            state_dict,
+            kind="exponential-weight-average",
+            expected_config={
+                "interval": self.interval,
+                "decay": self.decay,
+                "warmup": self.warmup,
+            },
+        )
+        map_and_load_state_dict(self.module, state["module"])
+        self.count = _nonnegative_int(state["count"], "count")
+        self.num_saved = _nonnegative_int(state["num_saved"], "num_saved")
+
 
 def eval_ewa(
     curr_iter,
@@ -308,11 +433,7 @@ def eval_ewa(
         ewa.get_latest_like(model).eval(),
         val_reader,
         cfg.device,
-        max_num_batches=(
-            val_reader.num_batches()
-            if curr_iter == cfg.iterations or full_eval
-            else cfg.eval_batches
-        ),
+        max_num_batches=_get_eval_batch_count(curr_iter, val_reader, cfg, full_eval),
         ctx=type_ctx,
         moe=cfg.moe,
         get_router_logits=False,  # we dont track router logits for EWA

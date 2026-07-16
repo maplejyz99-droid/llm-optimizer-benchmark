@@ -1,8 +1,6 @@
 import argparse
 import copy
 import inspect
-import json
-import os
 import random
 import sys
 from pathlib import Path
@@ -30,6 +28,7 @@ from optim.mars import MARS
 from optim.magma import MagmaAdamW, MagmaMuon
 from optim.muon import CombinedScheduler, DistributedMuon, Muon
 from optim.newton_muon import NewtonMuon
+from optim.experimental.softeq_muon import SoftEqK2000Muon
 from optim.prodigy import Prodigy
 from optim.schedule import cos_inf_schedule, wsd_schedule
 from optim.schedulefree import AdamWScheduleFree, SGDScheduleFree
@@ -37,6 +36,58 @@ from optim.scion import Scion, ScionLight, scion_partitions
 from optim.sign import Signum
 from optim.soap import SOAP
 from optim.sophia import SophiaG
+from run_manifest import (build_data_manifest, build_run_manifest,
+                          collect_runtime_identity, ensure_compatible_manifest,
+                          sanitized_config, write_json_atomic)
+
+
+def _run_synchronized_action(
+    distributed_backend,
+    action_name,
+    action,
+    *,
+    master_only=False,
+):
+    local_exception = None
+    result = None
+    if not master_only or distributed_backend.is_master_process():
+        try:
+            result = action()
+        except BaseException as exc:
+            local_exception = exc
+
+    failure = None
+    if local_exception is not None:
+        failure = {
+            "rank": int(getattr(distributed_backend, "rank", 0)),
+            "type": type(local_exception).__name__,
+            "message": str(local_exception),
+        }
+    gather = getattr(distributed_backend, "all_gather_object", None)
+    if gather is None:
+        if distributed_backend.get_world_size() != 1:
+            raise RuntimeError(
+                "Distributed backend does not provide all_gather_object()."
+            )
+        failures = [failure]
+    else:
+        failures = gather(failure)
+    failures = [item for item in failures if item is not None]
+    if failures:
+        if local_exception is not None:
+            raise local_exception
+        first = failures[0]
+        raise RuntimeError(
+            f"{action_name} failed on rank {first['rank']}: "
+            f"{first['type']}: {first['message']}"
+        )
+    return result
+
+
+MAGMA_OPT_LABELS = {
+    "adamw-magma": "AdamW Magma",
+    "muon-magma": "Muon Magma",
+}
 
 
 def get_mup_width_mult(args):
@@ -91,9 +142,32 @@ def get_args():
 def main(args, parser):
     if args.opt == "newton-muon" and args.distributed_backend is not None:
         raise ValueError("Newton-Muon v1 only supports single-device dense Llama.")
+    if args.opt in MAGMA_OPT_LABELS and args.distributed_backend is not None:
+        raise ValueError(
+            f"{MAGMA_OPT_LABELS[args.opt]} currently only supports single-device "
+            "execution because its stochastic masks are not synchronized across ranks."
+        )
+    if args.opt in {"gn-prox", "gn-full"} and args.distributed_backend is not None:
+        raise ValueError(
+            "Benchmark GN currently only supports single-device execution; "
+            "multi-rank gradients are not synchronized."
+        )
+    args.run_seed = args.seed
     distributed_backend = distributed.make_backend_from_args(args)
+    try:
+        return _main_with_backend(args, parser, distributed_backend)
+    finally:
+        distributed_backend.finalize()
+
+
+def _main_with_backend(args, parser, distributed_backend):
     args = distributed_backend.get_adjusted_args_for_process(args)
     args.world_size = distributed_backend.get_world_size()
+    if args.opt in MAGMA_OPT_LABELS and args.world_size > 1:
+        raise ValueError(
+            f"{MAGMA_OPT_LABELS[args.opt]} requires world_size=1 because its "
+            "stochastic masks are not synchronized across ranks."
+        )
     if args.opt == "newton-muon":
         if args.world_size != 1:
             raise ValueError("Newton-Muon v1 only supports world_size=1.")
@@ -101,6 +175,15 @@ def main(args, parser):
             raise ValueError("Newton-Muon v1 does not support MoE models.")
         if args.model != "llama":
             raise ValueError("Newton-Muon v1 only supports --model llama.")
+    if args.opt == "softeq-k2000-muon":
+        if args.moe:
+            raise ValueError("SoftEq K=2000 Muon only supports dense models.")
+        if args.model not in {"llama", "mup_llama"}:
+            raise ValueError(
+                "SoftEq K=2000 Muon only supports --model llama or --model mup_llama."
+            )
+    if args.opt in {"sf-adamw", "sf-sgd"} and args.scheduler != "none":
+        raise ValueError("Schedule-free optimizers require --scheduler none.")
     if args.wandb and wandb is None:
         raise ImportError("wandb is not installed; rerun without --wandb or install wandb.")
 
@@ -119,28 +202,88 @@ def main(args, parser):
 
     exp_name = get_exp_name(args, parser, distributed_backend)
     exp_dir = Path(args.results_base_folder) / exp_name
-    if distributed_backend.is_master_process() and args.wandb:
-        wandb.init(
-            project=args.wandb_project,
-            name=exp_name,
-            config=vars(args),
-            entity=args.wandb_entity,
-        )
-        wandb.define_metric("iter")
-        wandb.define_metric("train/*", step_metric="iter")
-        wandb.define_metric("val/*", step_metric="iter")
-        wandb.define_metric("lr", step_metric="iter")
 
     print(f"Starting Experiment: {exp_name}")
     print(f"Experiment Directory: {exp_dir}")
-    print(f"Config:\n{vars(args)}\n")
 
     print(f"Loading dataset: '{args.dataset}'")
     datareaders = get_data_readers(args)
+    data_manifest = datareaders.get("_data_manifest")
+    if data_manifest is None:
+        data_manifest = build_data_manifest(args.dataset, {})
+    runtime_identity = collect_runtime_identity()
+    if hasattr(torch, "__version__"):
+        runtime_identity["torch_runtime"] = {
+            "version": str(torch.__version__),
+            "cuda": str(getattr(getattr(torch, "version", None), "cuda", None)),
+        }
+    run_manifest = build_run_manifest(
+        args,
+        data_manifest,
+        runtime=runtime_identity,
+    )
+    args.run_identity = run_manifest["run_identity"]
+    args.metric_semantics = run_manifest["metric_semantics"]
 
-    model = get_model(args).to(
-        args.device
-    )  # todo: take care of initializing the model if args.use_pretrained != 'none'
+    latest_ckpt_dir = exp_dir / "ckpts" / "latest"
+    if (latest_ckpt_dir / "main.pt").exists() and args.resume_from is None:
+        if not args.auto_resume:
+            raise ValueError(
+                f"The experiment dir {exp_dir} already exists. "
+                + "To resume training, set auto_resume=True. "
+                + "Otherwise, specify a different experiment name. "
+            )
+        args.resume_from = str(latest_ckpt_dir)
+
+    _run_synchronized_action(
+        distributed_backend,
+        "experiment directory creation",
+        lambda: exp_dir.mkdir(parents=True, exist_ok=True),
+        master_only=True,
+    )
+
+    distributed_backend.barrier()
+    manifest_path = exp_dir / "run_manifest.json"
+    _run_synchronized_action(
+        distributed_backend,
+        "run manifest compatibility check",
+        lambda: ensure_compatible_manifest(manifest_path, run_manifest),
+    )
+    _run_synchronized_action(
+        distributed_backend,
+        "run manifest write",
+        lambda: write_json_atomic(manifest_path, run_manifest),
+        master_only=True,
+    )
+    distributed_backend.barrier()
+
+    public_config = sanitized_config(args)
+    print(f"Config:\n{public_config}\n")
+    if args.wandb:
+        def initialize_wandb():
+            wandb.init(
+                project=args.wandb_project,
+                name=exp_name,
+                config=public_config,
+                entity=args.wandb_entity,
+            )
+            wandb.define_metric("iter")
+            wandb.define_metric("train/*", step_metric="iter")
+            wandb.define_metric("val/*", step_metric="iter")
+            wandb.define_metric("lr", step_metric="iter")
+
+        _run_synchronized_action(
+            distributed_backend,
+            "W&B initialization",
+            initialize_wandb,
+            master_only=True,
+        )
+
+    model = _run_synchronized_action(
+        distributed_backend,
+        "model construction",
+        lambda: get_model(args).to(args.device),
+    )
     if args.opt in {"gn-prox", "gn-full"}:
         # GN uses torch.func JVP; force math SDP backend to avoid Flash forward-AD errors.
         if "cuda" in args.device:
@@ -276,6 +419,31 @@ def main(args, parser):
             momentum=args.momentum,
             nesterov=args.nesterov,
             ns_steps=args.muon_ns_steps,
+            adamw_params=None,
+            adamw_lr=args.lr,
+            adamw_betas=(args.beta1, args.beta2),
+            adamw_eps=1e-8,
+            adamw_wd=args.weight_decay,
+        )
+    elif args.opt == "softeq-k2000-muon":
+        param_list = (
+            list(model.parameters())
+            if args.distributed_backend is None
+            else list(model.module.parameters())
+        )
+        muon_lr = args.muon_lr_factor
+        if args.model == "mup_llama":
+            muon_lr = args.muon_lr_factor / get_mup_width_mult(args)
+            print(
+                "muP Llama SoftEq-Muon mode: scaling MuonEq matrix lr "
+                f"from {args.muon_lr_factor} to {muon_lr}. "
+                "AdamW backup lr remains args.lr."
+            )
+        opt = SoftEqK2000Muon(
+            muon_params=param_list,
+            lr=muon_lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
             adamw_params=None,
             adamw_lr=args.lr,
             adamw_betas=(args.beta1, args.beta2),
@@ -503,7 +671,7 @@ def main(args, parser):
             eps=1e-7,  # muon pytorch uses smaller eps
             adjust_lr_fn=None,  # to make the orthogonalized update have a consistent RMS across rectangular matrices
         )
-    else:
+    elif args.opt == "sgd":
         opt = torch.optim.SGD(
             group_specs,
             lr=args.lr,
@@ -511,6 +679,8 @@ def main(args, parser):
             weight_decay=args.weight_decay,
             nesterov=args.nesterov,
         )
+    else:
+        raise ValueError(f"Unknown optimizer: {args.opt}")
     print(f"\nOptimizer:\n{opt}")
     if args.log_optimizer_groups:
         log_optimizer_groups(opt, param_to_name, "before scheduler")
@@ -544,7 +714,7 @@ def main(args, parser):
                     div_factor=1e2,
                     final_div_factor=args.final_div_factor,
                 )
-                if args.opt not in {"muon", "muon-magma", "newton-muon"}
+                if args.opt not in {"muon", "muon-magma", "newton-muon", "softeq-k2000-muon"}
                 else CombinedScheduler(opt, args)
             )
         elif args.scheduler == "cos_inf":
@@ -557,7 +727,7 @@ def main(args, parser):
             )
             scheduler = (
                 torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
-                if args.opt not in {"muon", "muon-magma", "newton-muon"}
+                if args.opt not in {"muon", "muon-magma", "newton-muon", "softeq-k2000-muon"}
                 else CombinedScheduler(opt, args)
             )
         elif args.scheduler == "wsd":
@@ -571,7 +741,7 @@ def main(args, parser):
             )
             scheduler = (
                 torch.optim.lr_scheduler.LambdaLR(opt, lambda_schedule)
-                if args.opt not in {"muon", "muon-magma", "newton-muon"}
+                if args.opt not in {"muon", "muon-magma", "newton-muon", "softeq-k2000-muon"}
                 else CombinedScheduler(opt, args)
             )
         else:
@@ -580,19 +750,6 @@ def main(args, parser):
         scheduler = None
     if args.log_optimizer_groups:
         log_optimizer_groups(opt, param_to_name, "after scheduler init")
-
-    if (exp_dir / "ckpts" / "latest" / "main.pt").exists():
-        if not args.auto_resume:
-            raise ValueError(
-                f"The experiment dir {exp_dir} already exists. "
-                + "To resume training, set auto_resume=True. "
-                + "Otherwise, specify a different experiment name. "
-            )
-        else:
-            # Auto resume overwrites resume_from
-            args.resume_from = str(exp_dir / "ckpts" / "latest")
-    elif distributed_backend.is_master_process():
-        exp_dir.mkdir(parents=True, exist_ok=True)
 
     stats = train(
         model=model,
@@ -604,15 +761,20 @@ def main(args, parser):
         cfg=args,
     )
 
-    stats["args"] = vars(args)
-    if distributed_backend.is_master_process():
-        with open(exp_dir / "summary.json", "w") as fs:
-            json.dump(stats, fs)
-    distributed_backend.finalize()
+    stats["args"] = public_config
+    stats["run_identity"] = args.run_identity
+    stats["metric_semantics"] = args.metric_semantics
+    _run_synchronized_action(
+        distributed_backend,
+        "summary write",
+        lambda: write_json_atomic(exp_dir / "summary.json", stats),
+        master_only=True,
+    )
 
 
 def get_data_readers(args, verbose=True):
     data_srcs = get_dataset(args)
+    data_manifest = build_data_manifest(args.dataset, data_srcs)
     train_reader = DataReader(
         data_src=data_srcs["train"],
         batch_size=args.batch_size,
@@ -639,6 +801,7 @@ def get_data_readers(args, verbose=True):
     return {
         "train": train_reader,
         "val": val_reader,
+        "_data_manifest": data_manifest,
     }
 
 
@@ -685,6 +848,11 @@ def get_exp_name(
         "log_optimizer_groups",
         "dynamics_logger_cfg",
         "experiment_name",
+        "resume_from",
+        "allow_legacy_checkpoint_resume",
+        "run_identity",
+        "run_seed",
+        "metric_semantics",
     ],
 ):
     # Set the custom exp name if needed
@@ -716,7 +884,7 @@ def get_exp_name(
     # Generate the rest of the string with non-default arguments
     non_default_parts = []
     for key, value in vars(args).items():
-        if key in ignore_args:
+        if key in ignore_args or key.startswith("notify_"):
             continue
         if key not in defaults:
             print(f"Warning: {key} not in defaults")
