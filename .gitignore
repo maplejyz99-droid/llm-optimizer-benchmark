@@ -212,6 +212,8 @@ __marimo__/
 # local artifacts and remote runtime state
 exps
 logs
+/runs
+/results
 src/data/datasets
 wandb/
 .vscode/

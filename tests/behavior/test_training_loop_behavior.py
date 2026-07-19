@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from tests._helpers.training_harness import (
+    FakeScalar,
+    FakeTrainingModel,
     loaded_training_base_module,
     make_train_components,
     make_training_cfg,
@@ -100,6 +102,27 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                 2,
             )
 
+    def test_raw_final_eval_token_cap_is_forwarded_and_counted(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            final_eval_batches=None,
+            final_eval_tokens=7,
+            wandb=True,
+        )
+        events, stats = self.run_train(cfg)
+        eval_events = [event for event in events if event[0] == "eval"]
+        eval_logs = [
+            event[1]
+            for event in events
+            if event[0] == "wandb.log" and "final-val/loss" in event[1]
+        ]
+
+        self.assertEqual(eval_events, [("eval", 3, False, False, 7)])
+        self.assertEqual(eval_logs[0]["final-val/evaluated_batches"], 1)
+        self.assertEqual(eval_logs[0]["final-val/evaluated_tokens"], 7)
+        self.assertEqual(stats["validation_records"][0]["evaluated_batches"], 1)
+        self.assertEqual(stats["validation_records"][0]["evaluated_tokens"], 7)
+
     def test_normal_optimizer_one_step_order_is_preserved(self):
         cfg = make_training_cfg(iterations=1, scheduler="cos", eval_interval=100)
         events, stats = self.run_train(cfg)
@@ -190,7 +213,7 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertNotIn("scheduler.step", names)
         self.assertEqual(stats["completed_iterations"], 1)
 
-    def test_schedulefree_train_mode_runs_before_standard_optimizer_step(self):
+    def test_schedulefree_train_mode_runs_before_training_forward(self):
         cfg = make_training_cfg(
             iterations=1,
             opt="sf-adamw",
@@ -200,7 +223,18 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         events, stats = self.run_train(cfg, scheduler_override=None)
         names = event_names(events)
 
-        assert_in_order(self, names, ["opt.train", "opt.step", "opt.zero_grad"])
+        assert_in_order(
+            self,
+            names,
+            [
+                "opt.train",
+                "get_batch",
+                "model.forward",
+                "loss.backward",
+                "opt.step",
+                "opt.zero_grad",
+            ],
+        )
         self.assertEqual(stats["completed_iterations"], 1)
 
     def test_precondition_flag_is_read_once_and_passed_to_each_microstep(self):
@@ -248,7 +282,22 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertEqual(eval_logs[-1]["tokens"], 96)
         self.assertEqual(stats["completed_iterations"], 2)
 
-    def test_train_logging_uses_last_microstep_loss_after_accumulation(self):
+    def test_train_logging_uses_global_step_microbatch_means(self):
+        class VariableMetricModel(FakeTrainingModel):
+            def __init__(self, events):
+                super().__init__(events)
+                self._losses = iter((1.0, 2.0, 6.0))
+                self._aux_losses = iter((3.0, 6.0, 12.0))
+
+            def __call__(self, x, targets=None, moe=False, **kwargs):
+                self.events.append(("model.forward", x, targets, moe, dict(kwargs)))
+                return {
+                    "loss": FakeScalar(next(self._losses), self.events, "train"),
+                    "aux_losses": {
+                        "balance": FakeScalar(next(self._aux_losses))
+                    },
+                }
+
         cfg = make_training_cfg(
             iterations=1,
             acc_steps=3,
@@ -256,7 +305,21 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             log_interval=1,
             wandb=True,
         )
-        events, stats = self.run_train(cfg)
+        events = []
+        capture = {"events": events, "checkpoint_iter": 0}
+        _model, opt, scheduler, backend, datareaders = make_train_components(events)
+        model = VariableMetricModel(events)
+        with loaded_training_base_module(capture) as training_base:
+            with redirect_stdout(StringIO()):
+                stats = training_base.train(
+                    model=model,
+                    opt=opt,
+                    datareaders=datareaders,
+                    scheduler=scheduler,
+                    exp_dir=Path("/tmp/llmopt-behavior-exp"),
+                    distributed_backend=backend,
+                    cfg=cfg,
+                )
         train_logs = [
             event[1]
             for event in events
@@ -264,8 +327,13 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         ]
 
         self.assertEqual(len(train_logs), 1)
-        self.assertEqual(train_logs[0]["train/loss"], 2.0)
+        self.assertEqual(train_logs[0]["train/loss"], 3.0)
+        self.assertEqual(train_logs[0]["train/balance"], 7.0)
         self.assertEqual(events.count(("loss.backward", "train")), 3)
+        self.assertIn(("reduce_mean", (3.0, 7.0, 48.0)), events)
+        self.assertEqual(stats["train_loss"], [3.0])
+        self.assertEqual(stats["train_records"][0]["aux_losses"], {"balance": 7.0})
+        self.assertEqual(stats["train_records"][0]["effective_target_tokens"], 48)
         self.assertEqual(stats["completed_iterations"], 1)
 
     def test_sophiag_hessian_uses_last_microstep_batch_after_accumulation(self):
@@ -303,6 +371,84 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertEqual(sampled_forwards[0][2], "train_y_3")
         self.assertIn(("opt.update_hessian",), events)
         self.assertEqual(stats["completed_iterations"], 1)
+        self.assertEqual(stats["sophia_estimator"]["refresh_count"], 1)
+        self.assertEqual(stats["sophia_estimator"]["actual_examples"], 2)
+        self.assertEqual(stats["sophia_estimator"]["actual_tokens"], 16)
+
+    def test_sophiag_global_accum_replays_every_microbatch_and_updates_once(self):
+        cfg = make_training_cfg(
+            iterations=1,
+            opt="sophiag",
+            acc_steps=3,
+            batch_size=2,
+            sequence_length=8,
+            sophia_bs=6,
+            sophia_estimator_mode="global_accum",
+            scheduler="cos",
+            eval_interval=100,
+            precondition_frequency=1,
+            training_semantics={
+                "sophia_hessian_estimator": {
+                    "expected_examples_per_refresh": 6,
+                    "expected_tokens_per_refresh": 48,
+                    "optimizer_scale_tokens": 48,
+                    "refresh_frequency": 1,
+                    "version": "global_accum_gnb_v1",
+                }
+            },
+        )
+        events, stats = self.run_train(
+            cfg,
+            capture_overrides={"unique_batches": True},
+        )
+        sampled_forwards = [
+            event
+            for event in events
+            if event[0] == "model.forward"
+            and event[1].startswith("train_x_")
+            and event[4].get("get_logits")
+        ]
+
+        self.assertEqual(
+            [event[1] for event in sampled_forwards],
+            ["train_x_1", "train_x_2", "train_x_3"],
+        )
+        self.assertEqual(events.count(("loss.backward", "sampled")), 3)
+        self.assertEqual(events.count(("opt.update_hessian",)), 1)
+        for microstep_idx in range(3):
+            self.assertEqual(
+                events.count(("microstep_context", microstep_idx, 3)), 2
+            )
+        self.assertEqual(
+            stats["sophia_estimator"],
+            {
+                "mode": "global_accum",
+                "version": "global_accum_gnb_v1",
+                "refresh_frequency": 1,
+                "expected_examples_per_refresh": 6,
+                "expected_tokens_per_refresh": 48,
+                "optimizer_scale_tokens": 48,
+                "refresh_count": 1,
+                "actual_examples": 6,
+                "actual_tokens": 48,
+                "rank_state_consistent": None,
+                "rank_state_digest": None,
+            },
+        )
+
+    def test_sophiag_global_accum_rejects_mismatched_sophia_bs(self):
+        cfg = make_training_cfg(
+            opt="sophiag",
+            acc_steps=3,
+            batch_size=2,
+            sophia_bs=5,
+            sophia_estimator_mode="global_accum",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "world_size \\* local_batch \\* local_acc_steps"
+        ):
+            self.run_train(cfg)
 
     def test_mars_accumulation_finishes_before_last_grad_update(self):
         cfg = make_training_cfg(
@@ -458,9 +604,9 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertEqual(
             eval_events,
             [
-                ("eval", 2, False, False),
-                ("eval", 3, False, False),
-                ("eval", 3, False, False),
+                ("eval", 2, False, False, None),
+                ("eval", 3, False, False, None),
+                ("eval", 3, False, False, None),
             ],
         )
         self.assertEqual([logs["iter"] for logs in wandb_logs], [0, 1, 2])
@@ -480,6 +626,32 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
 
         assert_in_order(self, event_names(events), ["eval", "eval_ewa", "barrier"])
         self.assertEqual(events.count(("barrier",)), 1)
+
+    def test_validation_records_include_weight_average_evaluation_counts(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            eval_interval=1,
+            exponential_weight_average=True,
+        )
+        _events, stats = self.run_train(
+            cfg,
+            capture_overrides={
+                "ewa_evaluation_counts": {
+                    "evaluated_batches": 3,
+                    "evaluated_tokens": 41,
+                }
+            },
+        )
+
+        self.assertEqual(
+            stats["validation_records"][0]["weight_average_evaluations"],
+            {
+                "ewa": {
+                    "evaluated_batches": 3,
+                    "evaluated_tokens": 41,
+                }
+            },
+        )
 
     def test_evaluation_restores_training_rng_state(self):
         cfg = make_training_cfg(iterations=0, eval_interval=1)
@@ -549,7 +721,7 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                     opt=opt,
                 )
 
-        self.assertEqual(result, (None, None, None))
+        self.assertEqual(result, (None, None, None, None))
         self.assertEqual(events, [])
 
     def test_eval_and_log_sets_model_eval_and_restores_train_for_normal_optimizer(self):
@@ -578,7 +750,15 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                 )
         names = event_names(events)
 
-        self.assertEqual(result, (1.25, 2.5, 0.75))
+        self.assertEqual(
+            result,
+            (
+                1.25,
+                2.5,
+                0.75,
+                {"evaluated_batches": 2, "evaluated_tokens": 32},
+            ),
+        )
         assert_in_order(self, names, ["model.eval", "val.set_step", "eval", "model.train"])
         self.assertNotIn("opt.eval", names)
 
@@ -608,14 +788,60 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                 )
         names = event_names(events)
 
-        self.assertEqual(result, (1.25, 2.5, 0.75))
+        self.assertEqual(
+            result,
+            (
+                1.25,
+                2.5,
+                0.75,
+                {"evaluated_batches": 2, "evaluated_tokens": 32},
+            ),
+        )
         assert_in_order(
             self,
             names,
-            ["model.eval", "opt.eval", "val.set_step", "eval", "wandb.log", "model.train"],
+            [
+                "model.eval",
+                "opt.eval",
+                "val.set_step",
+                "eval",
+                "wandb.log",
+                "model.train",
+                "opt.train",
+            ],
         )
 
-    def test_schedulefree_eval_sets_optimizer_eval_and_train_step_restores_train(self):
+    def test_schedulefree_eval_error_restores_model_and_optimizer_train_modes(self):
+        events = []
+        capture = {
+            "events": events,
+            "checkpoint_iter": 0,
+            "eval_error": RuntimeError("synthetic eval failure"),
+        }
+        model, opt, _scheduler, backend, datareaders = make_train_components(events)
+        cfg = make_training_cfg(opt="sf-adamw")
+
+        with loaded_training_base_module(capture) as training_base:
+            with self.assertRaisesRegex(RuntimeError, "synthetic eval failure"):
+                training_base.eval_and_log(
+                    tokens=0,
+                    curr_iter=0,
+                    epoch=0.0,
+                    model=model,
+                    val_reader=datareaders["val"],
+                    type_ctx=nullcontext(),
+                    distributed_backend=backend,
+                    cfg=cfg,
+                    opt=opt,
+                )
+
+        assert_in_order(
+            self,
+            event_names(events),
+            ["model.eval", "opt.eval", "eval", "model.train", "opt.train"],
+        )
+
+    def test_schedulefree_eval_restores_optimizer_before_next_forward(self):
         cfg = make_training_cfg(
             iterations=1,
             opt="sf-adamw",
@@ -633,12 +859,80 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                 "opt.eval",
                 "eval",
                 "model.train",
-                "get_batch",
                 "opt.train",
+                "get_batch",
+                "model.forward",
+                "loss.backward",
                 "opt.step",
             ],
         )
         self.assertEqual(stats["completed_iterations"], 1)
+
+    def test_schedulefree_final_eval_exports_metric_matching_eval_model(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            opt="sf-adamw",
+            scheduler="none",
+            final_eval_batches=1,
+        )
+        events, stats = self.run_train(cfg, scheduler_override=None)
+        export_events = [
+            event for event in events if event[0] == "atomic_torch_save"
+        ]
+
+        self.assertEqual(len(export_events), 1)
+        self.assertEqual(
+            export_events[0][1:4],
+            (
+                "/tmp/llmopt-behavior-exp/model_eval.pt",
+                "llm-optimizer-benchmark-evaluation-model",
+                "schedulefree-eval",
+            ),
+        )
+        self.assertEqual(
+            export_events[0][4],
+            {
+                "loss": 1.25,
+                "perplexity": 2.5,
+                "token_accuracy": 0.75,
+                "evaluated_batches": 1,
+                "evaluated_tokens": 16,
+            },
+        )
+        assert_in_order(
+            self,
+            event_names(events),
+            [
+                "opt.eval",
+                "eval",
+                "atomic_torch_save",
+                "model.train",
+                "opt.train",
+            ],
+        )
+        self.assertEqual(stats["completed_iterations"], 0)
+
+    def test_standard_optimizer_can_export_final_model_explicitly(self):
+        cfg = make_training_cfg(
+            iterations=0,
+            opt="adamw",
+            save_final_model=True,
+            final_eval_batches=1,
+        )
+        events, _stats = self.run_train(cfg)
+        export_events = [
+            event for event in events if event[0] == "atomic_torch_save"
+        ]
+
+        self.assertEqual(len(export_events), 1)
+        self.assertEqual(
+            export_events[0][1:4],
+            (
+                "/tmp/llmopt-behavior-exp/model_eval.pt",
+                "llm-optimizer-benchmark-evaluation-model",
+                "train-final",
+            ),
+        )
 
     def test_generated_text_table_uses_existing_wandb_and_prefix_gate(self):
         cfg = make_training_cfg(
@@ -704,11 +998,13 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                 "final-val/loss": 1.25,
                 "final-val/perplexity": 2.5,
                 "final-val/acc": 0.75,
+                "final-val/evaluated_batches": 3,
+                "final-val/evaluated_tokens": 48,
                 "val/moe_aux": 0.42,
                 "router/load_balance": 0.7,
             }
         ])
-        self.assertIn(("eval", 3, True, True), events)
+        self.assertIn(("eval", 3, True, True, None), events)
         self.assertIn(("visualize_routing", ("router-a", "router-b")), events)
         self.assertEqual(stats["completed_iterations"], 0)
 
@@ -744,7 +1040,15 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             and any(key.startswith("generated-text-") for key in event[1])
         ]
 
-        self.assertEqual(result, (1.25, 2.5, 0.75))
+        self.assertEqual(
+            result,
+            (
+                1.25,
+                2.5,
+                0.75,
+                {"evaluated_batches": 2, "evaluated_tokens": 32},
+            ),
+        )
         self.assertNotIn("model.generate_from_string", names)
         self.assertNotIn("wandb.Table.add_data", names)
         self.assertEqual(generated_logs, [])
@@ -780,7 +1084,15 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
             and any(key.startswith("generated-text-") for key in event[1])
         ]
 
-        self.assertEqual(result, (1.25, 2.5, 0.75))
+        self.assertEqual(
+            result,
+            (
+                1.25,
+                2.5,
+                0.75,
+                {"evaluated_batches": 3, "evaluated_tokens": 48},
+            ),
+        )
         self.assertIn(("model.generate_from_string", "Hello", 40, 0.9, None), events)
         self.assertIn(("wandb.Table.add_data", (6, 2.5, "Hello<generated>")), events)
         self.assertEqual(len(generated_logs), 1)
@@ -909,6 +1221,75 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertIn(("ewa.step", False), events)
         self.assertEqual(stats["completed_iterations"], 1)
 
+    def test_weight_average_publish_failure_is_synchronized(self):
+        cfg = make_training_cfg(
+            iterations=1,
+            expected_world_size=2,
+            eval_interval=100,
+            weight_average=True,
+            wa_horizon=1,
+            wa_interval=1,
+        )
+        events = []
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic WA publish failure"):
+            self.run_train(
+                cfg,
+                world_size=2,
+                events=events,
+                capture_overrides={
+                    "weight_averager_publish_error": RuntimeError(
+                        "synthetic WA publish failure"
+                    )
+                },
+            )
+
+        gathered_failures = [
+            event[1]
+            for event in events
+            if event[0] == "all_gather_object" and event[1] is not None
+        ]
+        self.assertTrue(
+            any(
+                failure["message"] == "synthetic WA publish failure"
+                for failure in gathered_failures
+            ),
+            events,
+        )
+
+    def test_dynamics_logger_initialization_failure_is_synchronized(self):
+        cfg = make_training_cfg(
+            log_dynamics=True,
+            dynamics_logger_cfg=__file__,
+            expected_world_size=2,
+        )
+        events = []
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic dynamics failure"):
+            self.run_train(
+                cfg,
+                world_size=2,
+                events=events,
+                capture_overrides={
+                    "dynamics_logger_error": RuntimeError(
+                        "synthetic dynamics failure"
+                    )
+                },
+            )
+
+        gathered_failures = [
+            event[1]
+            for event in events
+            if event[0] == "all_gather_object" and event[1] is not None
+        ]
+        self.assertTrue(
+            any(
+                failure["message"] == "synthetic dynamics failure"
+                for failure in gathered_failures
+            ),
+            events,
+        )
+
     def test_train_log_interval_writes_wandb_train_metrics_on_master(self):
         cfg = make_training_cfg(
             iterations=1,
@@ -926,7 +1307,7 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
 
         self.assertEqual(len(train_logs), 1)
         train_log = train_logs[0]
-        self.assertEqual(train_log["tokens"], 0)
+        self.assertEqual(train_log["tokens"], 16)
         self.assertEqual(train_log["iter"], 1)
         self.assertEqual(train_log["train/loss"], 2.0)
         self.assertAlmostEqual(train_log["train/perplexity"], 2.71828**2.0)
@@ -964,7 +1345,14 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertEqual(stats["val_acc"], [0.75, 0.75])
         self.assertEqual(
             stats["train_records"],
-            [{"iteration": 1, "tokens": 16, "loss": 2.0}],
+            [
+                {
+                    "iteration": 1,
+                    "tokens": 16,
+                    "loss": 2.0,
+                    "effective_target_tokens": 16,
+                }
+            ],
         )
         self.assertEqual(
             stats["validation_records"],
@@ -975,6 +1363,8 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                     "loss": 1.25,
                     "perplexity": 2.5,
                     "token_accuracy": 0.75,
+                    "evaluated_batches": 2,
+                    "evaluated_tokens": 32,
                 },
                 {
                     "iteration": 1,
@@ -982,6 +1372,8 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                     "loss": 1.25,
                     "perplexity": 2.5,
                     "token_accuracy": 0.75,
+                    "evaluated_batches": 3,
+                    "evaluated_tokens": 48,
                 },
             ],
         )
@@ -1008,7 +1400,7 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
         self.assertEqual(train_logs, [])
         self.assertEqual(len(notify_events), 1)
         self.assertEqual(notify_events[0][1]["curr_iter"], 1)
-        self.assertIsNone(notify_events[0][1]["train_loss"])
+        self.assertEqual(notify_events[0][1]["train_loss"], 2.0)
         self.assertEqual(notify_events[0][1]["val_loss"], 1.25)
         self.assertEqual(notify_events[0][1]["lr"], 0.01)
         self.assertEqual(stats["completed_iterations"], 1)
@@ -1163,6 +1555,10 @@ class TrainingLoopBehaviorTest(unittest.TestCase):
                     ],
                 )
                 self.assertEqual(events.count(("scheduler.step",)), 1)
+                self.assertEqual(
+                    stats["train_records"][0]["effective_target_tokens"],
+                    64,
+                )
                 self.assertEqual(stats["completed_iterations"], 1)
 
     def test_gn_checkpoint_and_resume_use_all_consumed_inner_batches(self):

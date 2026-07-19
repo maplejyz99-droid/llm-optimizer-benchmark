@@ -69,6 +69,10 @@ class WeightAverager:
             )
             self.num_saved += 1
 
+    def publishes_on_next_step(self):
+        """Return whether the next step reaches a persisted horizon."""
+        return (self.count + 1) % self.horizon == 0
+
     def state_dict(self):
         saved_counts = _saved_average_counts(self.save_dir, self.count)
         if len(saved_counts) != self.num_saved:
@@ -210,15 +214,25 @@ def _validate_averager_state(state_dict, *, kind, expected_config):
     return state_dict
 
 
-def _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval):
+def _get_eval_limits(curr_iter, val_reader, cfg, full_eval):
     if curr_iter != cfg.iterations and not full_eval:
-        return cfg.eval_batches
+        return cfg.eval_batches, None
 
     available_batches = val_reader.num_batches()
     final_eval_batches = getattr(cfg, "final_eval_batches", None)
-    if final_eval_batches is None:
-        return available_batches
-    return min(available_batches, final_eval_batches)
+    max_num_batches = (
+        available_batches
+        if final_eval_batches is None
+        else min(available_batches, final_eval_batches)
+    )
+    return max_num_batches, getattr(cfg, "final_eval_tokens", None)
+
+
+def _evaluation_count_logs(prefix, counts):
+    return {
+        f"{prefix}/evaluated_batches": counts["evaluated_batches"],
+        f"{prefix}/evaluated_tokens": counts["evaluated_tokens"],
+    }
 
 
 def eval_wa(
@@ -238,18 +252,21 @@ def eval_wa(
     if weight_averager.num_saved == 0:
         return
     if not cfg.wa_sweep_horizon:
+        max_num_batches, max_num_tokens = _get_eval_limits(
+            curr_iter, val_reader, cfg, full_eval
+        )
         val_reader.set_step(0)
-        val_acc, val_loss, val_perplexity, _, _ = eval(
+        val_acc, val_loss, val_perplexity, _, _, counts = eval(
             weight_averager.get_latest_like(model).eval(),
             val_reader,
             cfg.device,
-            max_num_batches=_get_eval_batch_count(
-                curr_iter, val_reader, cfg, full_eval
-            ),
+            max_num_batches=max_num_batches,
+            max_num_tokens=max_num_tokens,
             ctx=type_ctx,
             moe=cfg.moe,
             get_router_logits=False,  # we dont track router logits for WA
             cfg=cfg,
+            return_counts=True,
         )
 
         if cfg.wandb:
@@ -259,6 +276,7 @@ def eval_wa(
                     "final-val/loss_wa": val_loss,
                     "final-val/perplexity_wa": val_perplexity,
                     "final-val/acc_wa": val_acc,
+                    **_evaluation_count_logs("final-val/wa", counts),
                 }
             else:
                 logs = {
@@ -266,6 +284,7 @@ def eval_wa(
                     "val/loss_wa": val_loss,
                     "val/perplexity_wa": val_perplexity,
                     "val/acc_wa": val_acc,
+                    **_evaluation_count_logs("val/wa", counts),
                 }
             wandb.log(logs)
         print(
@@ -274,24 +293,29 @@ def eval_wa(
             f"val_pp={val_perplexity:.3f} "
             f"val_acc={val_acc:3f}"
         )
+        return counts
     else:
         losses = []
+        counts = None
         for horizon, avg_model in weight_averager.sweep_horizon_like(
             model, cfg.max_num_wa_sweeps
         ):
             avg_model.eval()
             val_reader.set_step(0)
-            _, val_loss, _, _, _ = eval(
+            max_num_batches, max_num_tokens = _get_eval_limits(
+                curr_iter, val_reader, cfg, full_eval
+            )
+            _, val_loss, _, _, _, counts = eval(
                 avg_model,
                 val_reader,
                 cfg.device,
-                max_num_batches=_get_eval_batch_count(
-                    curr_iter, val_reader, cfg, full_eval
-                ),
+                max_num_batches=max_num_batches,
+                max_num_tokens=max_num_tokens,
                 ctx=type_ctx,
                 moe=cfg.moe,
                 get_router_logits=False,
                 cfg=cfg,
+                return_counts=True,
             )
 
             losses.append((val_loss, horizon))
@@ -309,6 +333,7 @@ def eval_wa(
                     "final-val/perplexity_wa": 2.71828 ** losses[0][0],
                     "final-val/best_loss_wa": best_loss,
                     "final-val/best_perplexity_wa": 2.71828**best_loss,
+                    **_evaluation_count_logs("final-val/wa", counts),
                 }
             else:
                 logs = {
@@ -318,8 +343,10 @@ def eval_wa(
                     "val/best_loss_wa": best_loss,
                     "val/best_perplexity_wa": 2.71828**best_loss,
                     "wa_best_horizon": best_horizon,
+                    **_evaluation_count_logs("val/wa", counts),
                 }
             wandb.log(logs)
+        return counts
 
 
 class ExponentialWeightAverager:
@@ -428,16 +455,21 @@ def eval_ewa(
         # Only evaluate and log on master rank
         return
 
+    max_num_batches, max_num_tokens = _get_eval_limits(
+        curr_iter, val_reader, cfg, full_eval
+    )
     val_reader.set_step(0)
-    val_acc, val_loss, val_perplexity, _, _ = eval(
+    val_acc, val_loss, val_perplexity, _, _, counts = eval(
         ewa.get_latest_like(model).eval(),
         val_reader,
         cfg.device,
-        max_num_batches=_get_eval_batch_count(curr_iter, val_reader, cfg, full_eval),
+        max_num_batches=max_num_batches,
+        max_num_tokens=max_num_tokens,
         ctx=type_ctx,
         moe=cfg.moe,
         get_router_logits=False,  # we dont track router logits for EWA
         cfg=cfg,
+        return_counts=True,
     )
 
     if cfg.wandb:
@@ -447,6 +479,7 @@ def eval_ewa(
                 "final-val/loss_ewa": val_loss,
                 "final-val/perplexity_ewa": val_perplexity,
                 "final-val/acc_ewa": val_acc,
+                **_evaluation_count_logs("final-val/ewa", counts),
             }
         else:
             logs = {
@@ -454,6 +487,7 @@ def eval_ewa(
                 "val/loss_ewa": val_loss,
                 "val/perplexity_ewa": val_perplexity,
                 "val/acc_ewa": val_acc,
+                **_evaluation_count_logs("val/ewa", counts),
             }
         if cfg.moe and cfg.plot_router_logits:
             pass
@@ -464,3 +498,4 @@ def eval_ewa(
         f"val_pp={val_perplexity:.3f} "
         f"val_acc={val_acc:3f}"
     )
+    return counts

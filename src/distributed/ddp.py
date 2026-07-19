@@ -1,18 +1,25 @@
 import math
 import os
 from contextlib import contextmanager
+from datetime import timedelta
 
 from torch.distributed import (
+    ReduceOp,
+    all_reduce as distributed_all_reduce,
     all_gather_object as distributed_all_gather_object,
     barrier as distributed_barrier,
     broadcast_object_list,
     destroy_process_group,
     get_world_size,
     init_process_group,
+    new_group,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .backend import DistributedBackend
+
+
+DEFAULT_CONTROL_TIMEOUT_SECONDS = 24 * 60 * 60
 
 
 class DataParallelDistributedBackend(DistributedBackend):
@@ -29,18 +36,65 @@ class DataParallelDistributedBackend(DistributedBackend):
         if "cuda" not in args.device:
             raise ValueError("DDP backend can not be used on non-CUDA devices.")
 
-        initialized = False
+        try:
+            control_timeout_seconds = int(
+                getattr(
+                    args,
+                    "distributed_control_timeout_seconds",
+                    DEFAULT_CONTROL_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "distributed_control_timeout_seconds must be a positive integer."
+            ) from exc
+        if control_timeout_seconds <= 0:
+            raise ValueError(
+                "distributed_control_timeout_seconds must be a positive integer."
+            )
+
+        self._training_backend = str(args.distributed_backend).lower()
+        self._default_group_initialized = False
+        self._control_group = None
+        self._finalized = False
         try:
             init_process_group(backend=args.distributed_backend)
-            initialized = True
+            self._default_group_initialized = True
             get_world_size()
+            # Python-object collectives coordinate long master-only operations such as
+            # final evaluation. Keeping them off the NCCL training group prevents an
+            # otherwise idle rank from holding a pending NCCL collective for the whole
+            # evaluation.
+            self._control_group = new_group(
+                backend="gloo",
+                timeout=timedelta(seconds=control_timeout_seconds),
+            )
         except BaseException:
-            if initialized:
-                try:
-                    destroy_process_group()
-                except BaseException:
-                    pass
+            self._cleanup_process_groups(suppress_errors=True)
             raise
+
+    def _cleanup_process_groups(self, *, suppress_errors):
+        first_error = None
+        if self._control_group is not None:
+            try:
+                destroy_process_group(self._control_group)
+            except BaseException as exc:
+                first_error = exc
+            finally:
+                self._control_group = None
+
+        if self._default_group_initialized:
+            try:
+                destroy_process_group()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            finally:
+                self._default_group_initialized = False
+
+        self._finalized = True
+        if first_error is not None and not suppress_errors:
+            raise first_error
 
     def get_adjusted_args_for_process(self, args):
         effective_batch_size = args.batch_size * args.acc_steps
@@ -85,17 +139,28 @@ class DataParallelDistributedBackend(DistributedBackend):
         return get_world_size()
 
     def barrier(self):
+        if self._training_backend == "nccl":
+            distributed_barrier(device_ids=[self.local_rank])
+            return
         distributed_barrier()
 
     def broadcast_object(self, value, src=0):
         payload = [value]
-        broadcast_object_list(payload, src=src)
+        broadcast_object_list(payload, src=src, group=self._control_group)
         return payload[0]
 
     def all_gather_object(self, value):
         values = [None] * self.get_world_size()
-        distributed_all_gather_object(values, value)
+        distributed_all_gather_object(values, value, group=self._control_group)
         return values
 
+    def reduce_mean(self, value):
+        reduced = value.detach().clone()
+        distributed_all_reduce(reduced, op=ReduceOp.SUM)
+        reduced.div_(self.get_world_size())
+        return reduced
+
     def finalize(self):
-        destroy_process_group()
+        if self._finalized:
+            return
+        self._cleanup_process_groups(suppress_errors=False)

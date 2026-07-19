@@ -37,5 +37,9 @@ class DistributedBackend(object):
     def all_gather_object(self, value):
         raise NotImplementedError
 
+    def reduce_mean(self, value):
+        """Average a tensor across the training process group."""
+        raise NotImplementedError
+
     def finalize(self):
         pass

@@ -1,6 +1,7 @@
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 
 from tests._helpers.behavior_harness import make_args_for_main, load_main_with_fakes
 
@@ -25,15 +26,12 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         self.assertEqual(type(scheduler).__name__, "OneCycleLR")
 
     def test_programmatic_unknown_optimizer_is_rejected_instead_of_becoming_sgd(self):
-        capture = {}
-        main_module = load_main_with_fakes(capture)
-        args, parser = make_args_for_main(["--opt", "sgd"])
+        main_module = load_main_with_fakes({})
+        args, _ = make_args_for_main(["--opt", "sgd"])
         args.opt = "not-a-real-optimizer"
 
         with self.assertRaisesRegex(ValueError, "Unknown optimizer"):
-            with redirect_stdout(StringIO()):
-                main_module.main(args, parser)
-        self.assertNotIn("train_kwargs", capture)
+            main_module.build_optimizer(args, None, [], set())
 
     def test_gn_uses_inner_adamw_and_zero_weight_decay(self):
         opt, scheduler, cfg = self._run_main(
@@ -140,6 +138,65 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         self.assertEqual(cfg.n_embd / cfg.scale_base_model, 4.0)
         self.assertEqual(opt.kwargs["lr"], 0.03 / 4.0)
 
+    def test_logged_parameter_counts_use_model_contract_for_tied_embeddings(self):
+        main_module = load_main_with_fakes({})
+
+        class TiedLlamaLikeModel:
+            def __init__(self):
+                shared_weight = SimpleNamespace(numel=lambda: 64)
+                self.lm_head = SimpleNamespace(weight=shared_weight)
+                self.transformer = SimpleNamespace(
+                    wte=SimpleNamespace(weight=shared_weight)
+                )
+
+            def get_num_params(self, non_embedding=True):
+                return 100
+
+        params_cnt, nonemb_param_cnt = main_module.get_logged_parameter_counts(
+            TiedLlamaLikeModel()
+        )
+
+        self.assertEqual(params_cnt, 100)
+        self.assertEqual(nonemb_param_cnt, 100)
+
+    def test_log_optimizer_groups_prints_effective_adamw_backup_lr(self):
+        main_module = load_main_with_fakes({})
+
+        class Param:
+            shape = (2, 2)
+
+        muon_param = Param()
+        backup_param = Param()
+        opt = SimpleNamespace(
+            param_groups=[
+                {
+                    "params": [muon_param, backup_param],
+                    "lr": 0.02,
+                    "adamw_lr_ratio": 0.1,
+                    "weight_decay": 0.1,
+                }
+            ],
+            state={
+                muon_param: {"use_muon": True},
+                backup_param: {"use_muon": False},
+            },
+        )
+        output = StringIO()
+
+        with redirect_stdout(output):
+            main_module.log_optimizer_groups(
+                opt,
+                {
+                    id(muon_param): "block.weight",
+                    id(backup_param): "norm.weight",
+                },
+                "test",
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("muon: block.weight shape=(2, 2) lr=0.02", rendered)
+        self.assertIn("adamw_backup: norm.weight shape=(2, 2) lr=0.002", rendered)
+
     def test_newton_muon_attaches_preconditioner_and_uses_combined_scheduler(self):
         opt, scheduler, cfg = self._run_main(
             [
@@ -186,9 +243,7 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         main_module = load_main_with_fakes(capture)
         args, parser = make_args_for_main(["--opt", "softeq-k2000-muon", "--model", "base"])
 
-        with self.assertRaisesRegex(
-            ValueError, r"only supports --model llama or (?:--model )?mup_llama"
-        ):
+        with self.assertRaisesRegex(ValueError, "only supports --model llama or mup_llama"):
             with redirect_stdout(StringIO()):
                 main_module.main(args, parser)
         self.assertNotIn("train_kwargs", capture)
@@ -198,16 +253,23 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         main_module = load_main_with_fakes(capture)
         args, parser = make_args_for_main(["--opt", "softeq-k2000-muon", "--moe"])
 
-        with self.assertRaisesRegex(
-            ValueError, r"(?:does not support MoE|only supports dense models)"
-        ):
+        with self.assertRaisesRegex(ValueError, "does not support MoE"):
             with redirect_stdout(StringIO()):
                 main_module.main(args, parser)
         self.assertNotIn("train_kwargs", capture)
 
     def test_sophia_and_mars_keep_special_constructor_parameters(self):
         sophia_opt, _, sophia_cfg = self._run_main(["--opt", "sophiag", "--sophia_rho", "0.08"])
-        mars_opt, _, mars_cfg = self._run_main(["--opt", "mars", "--mars_lr", "0.007"])
+        mars_opt, _, mars_cfg = self._run_main(
+            [
+                "--opt",
+                "mars",
+                "--mars_lr",
+                "0.007",
+                "--weight_decay",
+                "0.037",
+            ]
+        )
 
         self.assertEqual(type(sophia_opt).__name__, "SophiaG")
         self.assertEqual(sophia_opt.kwargs["rho"], 0.08)
@@ -216,6 +278,7 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         self.assertEqual(mars_opt.kwargs["lr"], 0.007)
         self.assertEqual(mars_opt.kwargs["betas"], (mars_cfg.mars_beta1, mars_cfg.mars_beta2))
         self.assertEqual(mars_opt.kwargs["lr_1d"], mars_cfg.lr)
+        self.assertEqual(mars_opt.kwargs["weight_decay_1d"], mars_cfg.weight_decay)
 
     def test_cadamw_keeps_cautious_constructor_parameters(self):
         opt, _, cfg = self._run_main(
@@ -296,6 +359,30 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
                     self.assertEqual(type(scheduler).__name__, "FakeCombinedScheduler")
                 else:
                     self.assertEqual(opt.kwargs["lr"], cfg.lr)
+
+    def test_muon_magma_remains_available_for_single_rank(self):
+        capture = {"world_size": 1}
+        main_module = load_main_with_fakes(capture)
+        args, parser = make_args_for_main(["--opt", "muon-magma"])
+
+        with redirect_stdout(StringIO()):
+            main_module.main(args, parser)
+
+        self.assertEqual(type(capture["train_kwargs"]["opt"]).__name__, "MagmaMuon")
+        self.assertEqual(capture["train_kwargs"]["cfg"].world_size, 1)
+
+    def test_magma_optimizer_build_rejects_multirank_world_size(self):
+        main_module = load_main_with_fakes({})
+        for opt_name, label in (
+            ("adamw-magma", "AdamW Magma"),
+            ("muon-magma", "Muon Magma"),
+        ):
+            with self.subTest(opt=opt_name):
+                args, _ = make_args_for_main(["--opt", opt_name])
+                args.world_size = 2
+
+                with self.assertRaisesRegex(ValueError, f"{label}.*world_size=1"):
+                    main_module.build_optimizer(args, None, [], set())
 
     def test_distributed_muon_keeps_group_specs_and_muon_parameters(self):
         opt, _, cfg = self._run_main(
@@ -385,9 +472,7 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
     def test_schedulefree_optimizers_reject_external_scheduler(self):
         capture = {}
         main_module = load_main_with_fakes(capture)
-        args, parser = make_args_for_main(
-            ["--opt", "sf-adamw", "--scheduler", "cos"]
-        )
+        args, parser = make_args_for_main(["--opt", "sf-adamw", "--scheduler", "cos"])
 
         with self.assertRaisesRegex(ValueError, "require --scheduler none"):
             with redirect_stdout(StringIO()):
@@ -499,6 +584,12 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         _, scheduler, _ = self._run_main(["--opt", "adamw", "--scheduler", "none"])
 
         self.assertIsNone(scheduler)
+        for scheduler_name in ("none", "cos", "wsd"):
+            with self.subTest(opt="adafactor", scheduler=scheduler_name):
+                _, adafactor_scheduler, _ = self._run_main(
+                    ["--opt", "adafactor", "--scheduler", scheduler_name]
+                )
+                self.assertIsNone(adafactor_scheduler)
 
     def test_cos_inf_and_wsd_use_lambda_lr_for_standard_optimizers(self):
         for scheduler_name in ("cos_inf", "wsd"):

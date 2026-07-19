@@ -18,7 +18,10 @@ def get_model(args):
     if args.model == "base":
         model = GPTBase(args)
         if args.use_pretrained != "none":
-            model.from_pretrained(args.use_pretrained)
+            model.from_pretrained(
+                args.use_pretrained,
+                from_dense=getattr(args, "from_dense", True),
+            )
         return model
     elif args.model == "llama":
         model = Llama(args)

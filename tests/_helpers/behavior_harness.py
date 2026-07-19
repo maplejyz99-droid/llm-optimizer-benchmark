@@ -151,6 +151,13 @@ class FakeParam:
             total *= value
         return total
 
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def size(self, dimension):
+        return self.shape[dimension]
+
     def __repr__(self):
         return f"FakeParam({self.name!r}, shape={self.shape!r})"
 
@@ -202,9 +209,10 @@ class FakeTinyModel:
 
 
 class FakeBackend:
-    def __init__(self, args, world_size=1):
+    def __init__(self, args, world_size=1, finalize_error=None):
         self.args = args
         self.world_size = world_size
+        self.finalize_error = finalize_error
         self.finalized = False
         self.finalize_count = 0
         self.barrier_count = 0
@@ -239,6 +247,8 @@ class FakeBackend:
     def finalize(self):
         self.finalized = True
         self.finalize_count += 1
+        if self.finalize_error is not None:
+            raise self.finalize_error
 
 
 class FakeOptimizer:
@@ -258,7 +268,17 @@ class FakeOptimizer:
 
 
 class FakeMuonOptimizer(FakeOptimizer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for group in self.param_groups:
+            for parameter in group["params"]:
+                self.state[parameter] = {
+                    "use_muon": parameter.ndim >= 2 and parameter.size(0) < 10000
+                }
+
     def _normalize_param_groups(self, params):
+        if isinstance(params, list) and params and isinstance(params[0], dict):
+            return [dict(group) for group in params]
         return [
             {
                 "params": list(params) if isinstance(params, (list, tuple)) else params,
@@ -357,7 +377,11 @@ def make_fake_main_replacements(capture):
     distributed_module = types.ModuleType("distributed")
 
     def make_backend_from_args(args):
-        backend = FakeBackend(args, world_size=capture.get("world_size", 1))
+        backend = FakeBackend(
+            args,
+            world_size=capture.get("world_size", 1),
+            finalize_error=capture.get("finalize_error"),
+        )
         capture["backend"] = backend
         return backend
 
@@ -388,7 +412,9 @@ def make_fake_main_replacements(capture):
 
     muon_module = types.ModuleType("optim.muon")
     muon_module.CombinedScheduler = FakeCombinedScheduler
-    muon_module.DistributedMuon = type("DistributedMuon", (FakeOptimizer,), {})
+    muon_module.DistributedMuon = type(
+        "DistributedMuon", (FakeMuonOptimizer,), {}
+    )
     muon_module.Muon = type("Muon", (FakeMuonOptimizer,), {})
 
     newton_module = types.ModuleType("optim.newton_muon")
@@ -417,20 +443,91 @@ def make_fake_main_replacements(capture):
         "artifacts": {},
         "identity": "fake-data-identity",
     }
+    run_manifest_module.build_evaluation_protocol = lambda args: {
+        "periodic": {"mode": "batch_cap", "max_batches": 64},
+        "final_and_full": {"mode": "full_dataset"},
+        "token_counting": "targets_not_equal_to_-1",
+        "identity": "fake-evaluation-protocol-identity",
+    }
 
     def build_run_manifest(args, data_manifest, **kwargs):
+        optimization_plan = kwargs.get("optimization_plan")
+        if optimization_plan is None:
+            optimization_plan = {
+                "schema_version": 1,
+                "strategy": {"id": f"{args.opt}_v1", "kind": "single"},
+                "components": [],
+                "scheduler": {"kind": "external", "algorithm": args.scheduler},
+                "gradient_processing": {"global_norm_clip": args.grad_clip},
+                "routing": {
+                    "update_routes": [],
+                    "overlays": [],
+                    "realization": {"status": "pending"},
+                },
+                "identity": "fake-optimization-intent-identity",
+            }
+        resolved = (
+            optimization_plan["routing"]["realization"].get("status")
+            == "resolved"
+        )
         manifest = {
-            "schema_version": 1,
-            "run_identity": "fake-run-identity",
+            "schema_version": 3,
+            "manifest_state": "resolved" if resolved else "preflight",
+            "preflight_identity": "fake-preflight-identity",
+            "run_identity": (
+                "fake-run-identity" if resolved else "fake-preflight-identity"
+            ),
             "data": data_manifest,
+            "code": kwargs.get(
+                "code",
+                {
+                    "head": "fake-head",
+                    "source_fingerprint_sha256": "fake-source",
+                },
+            ),
+            "runtime": kwargs.get(
+                "runtime",
+                {"python": {"version": "3.10.19"}, "packages": {}},
+            ),
+            "optimization_plan": optimization_plan,
             "metric_semantics": {
                 "validation_accuracy": "next_token_accuracy",
             },
+            "evaluation_protocol": {
+                "periodic": {"mode": "batch_cap", "max_batches": 64},
+                "final_and_full": {"mode": "full_dataset"},
+                "token_counting": "targets_not_equal_to_-1",
+                "identity": "fake-evaluation-protocol-identity",
+            },
+            "training_semantics": {},
         }
         capture["run_manifest"] = manifest
+        capture.setdefault("run_manifests", []).append(manifest)
         return manifest
 
     run_manifest_module.build_run_manifest = build_run_manifest
+
+    def resolve_optimization_plan(
+        plan,
+        optimizer,
+        named_parameters,
+        **kwargs,
+    ):
+        resolved = dict(plan)
+        resolved["routing"] = dict(plan["routing"])
+        resolved["routing"]["realization"] = {
+            "status": "resolved",
+            "identity": "fake-optimization-realization-identity",
+            "coverage": {
+                "unassigned_tensors": 0,
+                "multiply_assigned_tensors": 0,
+            },
+        }
+        capture["resolved_optimizer"] = optimizer
+        capture["resolved_named_parameters"] = list(named_parameters)
+        return resolved
+
+    run_manifest_module.resolve_optimization_plan = resolve_optimization_plan
     run_manifest_module.collect_runtime_identity = lambda: {
         "python": {"version": "3.10.19"},
         "packages": {},
@@ -452,12 +549,49 @@ def make_fake_main_replacements(capture):
 
     run_manifest_module.sanitized_config = sanitized_config
 
-    def ensure_compatible_manifest(path, manifest):
-        capture.setdefault("lifecycle_events", []).append("manifest_checked")
+    def require_resolved_run_manifest(path):
+        capture.setdefault("lifecycle_events", []).append(
+            "resume_manifest_checked"
+        )
+        if "resume_manifest_error" in capture:
+            raise capture["resume_manifest_error"]
+        if not Path(path).is_file():
+            raise ValueError(
+                "Resume requires an existing schema-v3 resolved run manifest."
+            )
+        return capture.get(
+            "existing_resolved_manifest",
+            {
+                "evaluation_protocol": {
+                    "identity": "fake-evaluation-protocol-identity"
+                }
+            },
+        )
+
+    run_manifest_module.require_resolved_run_manifest = (
+        require_resolved_run_manifest
+    )
+
+    def reconcile_run_manifest(path, manifest, *, phase="resolved"):
+        capture.setdefault("lifecycle_events", []).append(
+            f"{phase}_manifest_reconciled"
+        )
         if "manifest_error" in capture:
             raise capture["manifest_error"]
+        if phase == "resolved" and "resolved_manifest_error" in capture:
+            raise capture["resolved_manifest_error"]
+        default_action = "create" if phase == "preflight" else "upgrade"
+        action = capture.get(f"{phase}_reconcile_action", default_action)
+        capture.setdefault("manifest_reconcile_actions", []).append(
+            (phase, action)
+        )
+        if action != "keep":
+            capture.setdefault("atomic_json_writes", []).append(
+                (Path(path), manifest)
+            )
+        return action
 
-    run_manifest_module.ensure_compatible_manifest = ensure_compatible_manifest
+    run_manifest_module.reconcile_run_manifest = reconcile_run_manifest
 
     def write_json_atomic(path, payload):
         capture.setdefault("atomic_json_writes", []).append((Path(path), payload))
@@ -504,7 +638,12 @@ def load_main_with_fakes(capture):
         SRC_ROOT / "main.py",
         replacements=make_fake_main_replacements(capture),
     )
-    module.get_data_readers = lambda args: {"train": object(), "val": object()}
+
+    def get_data_readers(args):
+        capture["data_reader_calls"] = capture.get("data_reader_calls", 0) + 1
+        return {"train": object(), "val": object()}
+
+    module.get_data_readers = get_data_readers
     return module
 
 

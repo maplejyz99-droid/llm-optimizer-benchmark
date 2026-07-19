@@ -17,8 +17,6 @@ LOGS = [
     "/root/work/llm-optimizer-benchmark/logs/sophiag_124m_1p5B_b16a2_gpu1.log",
     "/root/work/llm-optimizer-benchmark/logs/cadamw_124m_1p5B_gpu0.log",
     "/root/work/llm-optimizer-benchmark/logs/adamw_magma_124m_1p5B_gpu1.log",
-    "/root/work/llm-optimizer-benchmark/logs/newton_muon_124m_1gpu_bs32_acc1.log",
-    "/root/work/llm-optimizer-benchmark/logs/muon_124m_1gpu_bs32_acc1.log",
 
 ]
 

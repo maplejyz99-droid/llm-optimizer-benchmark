@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 
 from tests._helpers.behavior_harness import load_main_with_fakes, parse_base_args
 
@@ -44,10 +46,21 @@ class ExperimentNameBehaviorTest(unittest.TestCase):
                 "/tmp/other",
                 "--log_interval",
                 "1",
+                "--eval_batches",
+                "7",
+                "--eval_seq_prefix",
+                "Hello",
+                "--final_eval_batches",
+                "7",
+                "--distributed_control_timeout_seconds",
+                "123",
             ]
         )
 
         self.assertEqual(changed_runtime, baseline)
+
+        changed_token_budget = self._name_for(["--final_eval_tokens", "4096"])
+        self.assertEqual(changed_token_budget, baseline)
 
     def test_notification_arguments_never_enter_generated_name(self):
         secret = "name-secret-value"
@@ -65,6 +78,19 @@ class ExperimentNameBehaviorTest(unittest.TestCase):
 
         self.assertEqual(notified, baseline)
         self.assertNotIn(secret, notified)
+
+    def test_runtime_semantics_enrichment_does_not_warn_or_change_name(self):
+        args, parser = parse_base_args([])
+        baseline = self.main_module.get_exp_name(args, parser, self.backend)
+        args.evaluation_protocol = {"identity": "evaluation-id"}
+        args.training_semantics = {"schedule_free_parameter_point": "v2"}
+
+        output = StringIO()
+        with redirect_stdout(output):
+            enriched = self.main_module.get_exp_name(args, parser, self.backend)
+
+        self.assertEqual(enriched, baseline)
+        self.assertEqual(output.getvalue(), "")
 
     def test_key_and_non_default_arguments_change_name(self):
         self.assertEqual(
