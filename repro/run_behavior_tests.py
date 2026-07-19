@@ -47,7 +47,7 @@ def flatten_suite(suite):
 def discovered_tests():
     loader = unittest.TestLoader()
     suite = loader.discover(
-        start_dir=str(TEST_ROOT),
+        start_dir=str(BEHAVIOR_ROOT),
         top_level_dir=str(REPO_ROOT),
     )
     return list(flatten_suite(suite))

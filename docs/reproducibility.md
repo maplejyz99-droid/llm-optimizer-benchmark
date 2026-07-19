@@ -99,12 +99,63 @@ does not run GPU training and does not install Track 3 dependencies.
 
 ## Run and data identity
 
-Every training entry now writes `run_manifest.json` before model construction or
-W&B initialization. Its `run_identity` covers the effective training config,
-source commit plus local `src/`/`scripts/` changes, installed runtime versions,
-and token artifact identity. Installation paths, results paths, notification
-credentials, and other location-only controls are recorded or redacted but do
-not change compatibility identity.
+Every training entry now creates a schema-v3 `run_manifest.json` in two phases.
+Before model construction it writes an active-only optimization intent and a
+`preflight_identity`, so an incompatible output directory still fails before
+allocating the model. After optimizer assembly, but before scheduler
+initialization, W&B, checkpoint loading, or training, it resolves the actual
+parameter routing and writes the final `run_identity`.
+
+The final identity covers the effective training config, versioned
+`optimization_plan`, realized optimizer routing, source commit plus local
+`src/`/`scripts/` changes, installed runtime versions, and token artifact
+identity. Installation paths, results paths, notification credentials, and
+other location-only controls are recorded or redacted but do not change
+compatibility identity.
+
+The parser still exposes every supported optimizer through one CLI namespace.
+The complete redacted namespace remains in `config` for auditing, while
+`compatibility_config` excludes all optimizer defaults. The automatically
+generated `optimization_plan` is the compatibility authority and records only
+the selected updater, fallback/inner updater, modifier, auxiliary estimator,
+effective scheduler, and gradient-processing semantics. Commands do not need
+additional schema arguments.
+
+Mathematically equivalent spellings are canonicalized before hashing. Examples
+include SOAP's negative `shampoo_beta` sentinel, Prodigy's implicit `beta3`,
+Adafactor's CLI scheduler spellings, tied-embedding Scion scales, and
+optimizer-variant fields that the selected update does not consume. Adafactor
+uses `relative_step=True`; the runtime therefore creates no external scheduler
+or scheduler checkpoint state. The resolved parameter-group view applies the
+same semantic projection instead of hashing every raw library default back into
+the final identity.
+
+Composite optimizers are represented without pretending they are a single
+algorithm:
+
+- Muon, MARS, and related variants use mutually exclusive `update_routes`.
+- GN records an outer method and its nested inner AdamW.
+- Magma is an overlapping modifier rather than a second updater.
+- SophiaG records its GNB Hessian estimator as an auxiliary component.
+
+Resolved routes record tensor and parameter counts, a canonical parameter-name
+SHA-256, semantic parameter-group hyperparameters, and exact-once updater
+coverage. Resolution also rejects trainable model parameters missing from the
+optimizer. Overlays may intentionally overlap updater routes and therefore do
+not count as multiply assigned updates. All ranks must derive the same preflight
+and final identity.
+
+Schema-v2 and older manifests are read-only evidence. A new binary refuses to
+resume them in place even if an old hash happens to match; use a new experiment
+directory rather than rewriting or silently upgrading an existing artifact.
+The only in-place state transition is `preflight -> resolved`. A compatible
+resolved resume keeps the original manifest bytes. The upgrade is rechecked
+under a process lock so a concurrent resolved writer cannot be overwritten.
+An unknown state, manifest-less checkpoint, changed evaluation protocol,
+completed root summary, or completed versioned evaluation summary fails before
+data/model initialization or artifact writes. Any explicit `--resume_from`
+must resolve to the same run directory's `ckpts/latest`, whose `main.pt` and
+resolved schema-v3 manifest must already exist.
 
 The compatibility identity includes the normalized compute device type: CPU,
 CUDA, and MPS runs are distinct, while `cuda:0` and `cuda:1` remain compatible
@@ -123,9 +174,16 @@ may cross example boundaries. This compatibility behavior is documented rather
 than silently changed; results from any future masked/boundary-aware format must
 use a new semantics ID and data artifact version.
 
-`summary.json` includes the run identity, metric semantics, and populated
-training/validation metric histories. Existing output directories with a
-different identity are rejected before model construction.
+`summary.json` includes the run identity, top-level `optimization_plan`, metric
+semantics, and populated training/validation metric histories. Obvious
+preflight mismatches are rejected before model construction; a mismatch in
+realized routing is rejected before W&B or training. Launcher completion
+verification requires schema v3 with resolved routing and checks that the run,
+evaluation-protocol, optimization-plan, and realization identities agree across
+the manifest, latest summary, and versioned evaluation summary. It also
+recomputes the evaluation-protocol, optimization-intent, optimization-realization,
+and final resolved-run SHA-256 values, so copying the same stale self-reported
+digest into all three artifacts does not pass verification.
 
 ## Exact checkpoint resume
 

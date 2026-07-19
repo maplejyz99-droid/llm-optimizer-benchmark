@@ -37,5 +37,8 @@ class SinlgeNodeBackend(DistributedBackend):
     def all_gather_object(self, value):
         return [value]
 
+    def reduce_mean(self, value):
+        return value
+
     def translate_model_parameter_name_for_node(self, parameter_name):
         return [parameter_name]

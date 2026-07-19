@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import distributed
 
@@ -31,6 +32,10 @@ def strict_bool(value):
 
 def validate_supported_args(args):
     """Reject legacy options that are parsed but have no runtime consumer."""
+    if args.final_eval_batches is not None and args.final_eval_tokens is not None:
+        raise ValueError(
+            "--final_eval_batches and --final_eval_tokens are mutually exclusive"
+        )
     if args.resume_from_swa is not None:
         raise ValueError("--resume_from_swa is not implemented; use --resume_from")
     if args.clipping_type != "no":
@@ -39,6 +44,20 @@ def validate_supported_args(args):
         raise ValueError("--clip_eta is not implemented and must remain 1.0")
     if args.n_kv_head is not None:
         raise ValueError("--n_kv_head is not implemented by the current models")
+    if args.mlp_dim_exp_factor != 1.0:
+        raise ValueError("--mlp_dim_exp_factor is not implemented and must remain 1.0")
+    if args.parallel_block and args.model not in {"base", "mup_gpt"}:
+        raise ValueError(
+            "--parallel_block is only implemented for --model base or mup_gpt"
+        )
+    if args.moe_routing == "expert_choice":
+        if not args.moe:
+            raise ValueError("--moe_routing expert_choice requires --moe")
+        if args.model not in {"base", "mup_gpt"}:
+            raise ValueError(
+                "--moe_routing expert_choice is only implemented for "
+                "--model base or mup_gpt"
+            )
     return args
 
 
@@ -47,10 +66,12 @@ def register_general_training_args(parser):
     parser.add_argument("--experiment_name", default=None, type=str)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--data_seed", default=1337, type=int)
-    parser.add_argument("--eval_interval", default=200, type=int)
+    parser.add_argument("--eval_interval", default=200, type=positive_int)
     parser.add_argument("--full_eval_at", nargs="+", type=int)
-    parser.add_argument("--eval_batches", default=64, type=int)
+    parser.add_argument("--eval_batches", default=64, type=positive_int)
     parser.add_argument("--final_eval_batches", default=None, type=positive_int)
+    parser.add_argument("--final_eval_tokens", default=None, type=positive_int)
+    parser.add_argument("--save_final_model", default=False, type=strict_bool)
     parser.add_argument("--device", default="cuda:0", type=str)
     parser.add_argument(
         "--distributed_backend",
@@ -58,6 +79,9 @@ def register_general_training_args(parser):
         type=str,
         required=False,
         choices=distributed.registered_backends(),
+    )
+    parser.add_argument(
+        "--distributed_control_timeout_seconds", default=86400, type=positive_int
     )
     parser.add_argument("--log_interval", default=50, type=int)
 
@@ -245,6 +269,14 @@ def register_prodigy_sophia_args(parser):
     parser.add_argument("--prodigy_fsdp_in_use", default=False, type=strict_bool)
     parser.add_argument("--sophia_rho", default=0.04, type=float)
     parser.add_argument("--sophia_bs", default=480, type=int)
+    parser.add_argument(
+        "--sophia_estimator_mode",
+        default="legacy_last_microbatch",
+        choices=["legacy_last_microbatch", "global_accum"],
+    )
+    parser.add_argument(
+        "--sophia_verify_rank_state", default=False, type=strict_bool
+    )
 
 
 def register_clipping_args(parser):
@@ -357,7 +389,23 @@ def register_weight_average_args(parser):
 
 
 def register_dataset_args(parser):
-    parser.add_argument("--datasets_dir", type=str, default="./src/data/datasets/")
+    parser.add_argument(
+        "--datasets_dir",
+        type=str,
+        default=os.environ.get("LLMOPT_DATASETS_DIR") or "./src/data/datasets/",
+        help=(
+            "Dataset directory or parent directory. Defaults to "
+            "LLMOPT_DATASETS_DIR when set, otherwise ./src/data/datasets/."
+        ),
+    )
+    parser.add_argument(
+        "--allow_dataset_download",
+        action="store_true",
+        help=(
+            "Allow dataset loaders to download/build missing data. Training "
+            "fails closed by default to prevent accidental large downloads."
+        ),
+    )
     parser.add_argument(
         "--dataset",
         default="slimpajama",
@@ -410,7 +458,13 @@ def register_model_args(parser):
     parser.add_argument(
         "--use_pretrained", default="none", type=str
     )  # 'none', 'gpt-2' or a path to the pretraind model
-    parser.add_argument("--from_dense", action="store_true")
+    parser.add_argument(
+        "--from_dense",
+        nargs="?",
+        const=True,
+        default=True,
+        type=strict_bool,
+    )
     parser.add_argument("--init_std", default=0.02, type=float)
     parser.add_argument("--dropout", default=0.0, type=float)
     parser.add_argument("--n_head", default=12, type=int)

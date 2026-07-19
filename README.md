@@ -38,6 +38,69 @@ python ./src/main.py --config_format base --model llama
 
 The above command trains a 123.59M parameters model with the Llama-style architecture. To train the MoE model, use the ```---moe``` flag.
 
+### Dataset locations and downloads
+
+Dataset paths are portable across machines. Pass `--datasets_dir` explicitly,
+or set `LLMOPT_DATASETS_DIR` to either a dataset directory or a parent containing
+the named dataset directories:
+
+```sh
+export LLMOPT_DATASETS_DIR=/path/to/llmopt/datasets
+python ./src/main.py --config_format base --model llama --dataset fineweb
+```
+
+An explicit `--datasets_dir` takes precedence over the environment variable. If
+neither is provided, the fallback remains `./src/data/datasets/`. Training never
+downloads missing FineWeb data implicitly: it fails with the checked paths and
+setup guidance. The legacy `sample-100BT` builder is available only with the
+explicit `--allow_dataset_download` flag; for large artifacts, prepare data as a
+separate operation instead of during training.
+
+For formal optimizer comparisons on the versioned 30B-token artifact, validate
+the data identity before launching a benchmark script:
+
+```sh
+export LLMOPT_DATASETS_DIR=/path/to/llmopt/datasets
+python ./scripts/data/check_fineweb_30b.py
+bash ./scripts/124m/adamw.sh
+```
+
+The preflight requires `fineweb-30B/train.bin`, `val.bin`, and `meta.json`, and
+verifies the GPT-2 tokenizer, `uint16` format, 30B training tokens, and 100M
+validation tokens without hashing or scanning the full token files. Machine-local
+symlinks under `src/data/datasets` are optional conveniences and are ignored by
+Git; they are not required for a fresh clone.
+
+### Run artifacts and repository-visible outputs
+
+Direct `python ./src/main.py ...` remains backward-compatible and writes below
+`./exps` unless `--results_base_folder` is supplied. For new benchmark runs, use
+the repository launcher so each run keeps its structured metrics, command,
+terminal log, lifecycle status, and optional GPU telemetry together:
+
+```sh
+python ./scripts/setup_runtime_paths.py \
+  --runs-root /path/to/large-disk/llmopt/runs \
+  --results-root /path/to/curated/llmopt-results
+
+python ./scripts/launch_run.py \
+  --runs-root /path/to/large-disk/llmopt/runs \
+  --suite benchmark/smoke \
+  --run-id adamw-124m-seed0 \
+  --gpu-ids 0 \
+  --monitor-gpu \
+  -- \
+  --config_format base --model llama --dataset slimpajama --opt adamw
+```
+
+The setup command creates ignored `runs` and `results` symlinks in the clone, so
+large machine-local artifacts are visible in an editor without entering Git.
+The launcher owns `--results_base_folder` and `--experiment_name`; do not pass
+them after `--`. It never overwrites an existing run directory. See
+[`docs/running-benchmark.md`](docs/running-benchmark.md) for the output tree,
+background-launch pattern, DDP use, checkpoint boundary, and a complete SophiaG
+example.
+
 ## Reproducibility
 
 We [present](https://github.com/epfml/llm-optimizer-benchmark/tree/dev/scripts) scripts for reproducing our benchmarking results for 124M, 210M, 720M dense Llama-based models, and 520M MoEs.
@@ -318,7 +381,11 @@ Given a multi-GPU machine with e.g. 4 GPUs, one can distribute the training usin
 torchrun --nproc_per_node=4 ./src/main.py --config_format base --distributed_backend nccl --dataset slimpajama --model base
 ```
 
-When using multiple GPUs, the data will be distributed among the GPUs by dividing the number of accumulation steps by the number of nodes. For instance if we train with a batch size of 32 and 4 accumulation steps, then each GPU will process batches of 32 elements and do 1 accumulation steps. For this reason we require `acc_steps` to be a multiple of the number of GPUs. 
+When using multiple GPUs, the global `batch_size * acc_steps` is split across
+workers. That product must be divisible by the number of GPUs. The backend uses
+the greatest common divisor to adjust both per-rank batch size and accumulation;
+for example, `batch_size=32`, `acc_steps=1`, and two GPUs becomes batch size 16
+per rank with one accumulation step.
 
 ## Experimenting locally on your device with CPU
 If do not have access to a GPU or just want to try the code locally on your device, you can try the Shakespeare dataset with character-level tokens:

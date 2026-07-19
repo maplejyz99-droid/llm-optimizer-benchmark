@@ -59,31 +59,63 @@ def eval(
     reader,
     device="cpu",
     max_num_batches=24,
+    max_num_tokens=None,
     ctx=nullcontext(),
     moe=False,
     get_router_logits=False,
     cfg=None,
+    return_counts=False,
 ):
     assert model.training == False
 
-    loss_list_val, loss_list_aux_val = [], {}
+    if max_num_tokens is not None:
+        max_num_tokens = int(max_num_tokens)
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be a positive integer")
+
+    loss_numerator = None
+    loss_list_aux_val = {}
     num_correct_targets = 0
     num_effective_targets = 0
+    evaluated_batches = 0
     router_logits = []
 
     for idx in range(max_num_batches):
+        if max_num_tokens is not None and num_effective_targets >= max_num_tokens:
+            break
         x, y = get_batch(reader, device=device)
+        valid_targets = y != -1
+        batch_effective_targets = int(valid_targets.sum().item())
+        if max_num_tokens is not None:
+            remaining_targets = max_num_tokens - num_effective_targets
+            if batch_effective_targets > remaining_targets:
+                y = y.clone()
+                flat_y = y.reshape(-1)
+                valid_indices = torch.nonzero(
+                    valid_targets.reshape(-1), as_tuple=False
+                ).reshape(-1)
+                flat_y[valid_indices[remaining_targets:]] = -1
+                valid_targets = y != -1
+                batch_effective_targets = remaining_targets
+
+        if batch_effective_targets == 0:
+            continue
         with ctx:
             outputs = model(x, targets=y, get_logits=True, moe=moe)
         val_loss = outputs["loss"]
 
-        loss_list_val.append(val_loss)
-        valid_targets = y != -1
+        weighted_loss = val_loss * batch_effective_targets
+        loss_numerator = (
+            weighted_loss
+            if loss_numerator is None
+            else loss_numerator + weighted_loss
+        )
         predictions = outputs["logits"].argmax(-1)
         num_correct_targets += int(
             ((predictions == y) & valid_targets).sum().item()
         )
-        num_effective_targets += int(valid_targets.sum().item())
+        num_effective_targets += batch_effective_targets
+        evaluated_batches += 1
 
         # auxiliary losses are optional
         for k, v in outputs["aux_losses"].items():
@@ -100,7 +132,7 @@ def eval(
     if num_effective_targets == 0:
         raise ValueError("validation accuracy has no effective targets (all targets are -1).")
     val_acc = num_correct_targets / num_effective_targets
-    val_loss = torch.stack(loss_list_val).mean().item()
+    val_loss = (loss_numerator / num_effective_targets).item()
     val_perplexity = 2.71828**val_loss
     val_aux_losses = {
         f"val/{k}": torch.stack(v).mean().item() for k, v in loss_list_aux_val.items()
@@ -123,7 +155,15 @@ def eval(
             .cpu()
         )
 
-    return val_acc, val_loss, val_perplexity, val_aux_losses, router_logits
+    result = (val_acc, val_loss, val_perplexity, val_aux_losses, router_logits)
+    if return_counts:
+        return result + (
+            {
+                "evaluated_batches": evaluated_batches,
+                "evaluated_tokens": num_effective_targets,
+            },
+        )
+    return result
 
 
 @torch.no_grad()

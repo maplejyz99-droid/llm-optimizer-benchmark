@@ -47,7 +47,10 @@ def get_dataset(args) -> Dict[str, np.ndarray]:
     if args.dataset == "slimpajama_chunk1":
         return get_slimpajama_chunk1(args.datasets_dir)
     if args.dataset == "fineweb":
-        return get_fineweb_data(args.datasets_dir)
+        return get_fineweb_data(
+            args.datasets_dir,
+            allow_download=getattr(args, "allow_dataset_download", False),
+        )
     if args.dataset == "finewebedu":
         return get_fineweb_edu_data(args.datasets_dir)
     if args.dataset == "c4":

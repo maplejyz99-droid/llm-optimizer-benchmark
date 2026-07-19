@@ -1,7 +1,10 @@
 import copy
+import hashlib
 import math
+import os
 import random
 import time
+import uuid
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -22,7 +25,7 @@ from optim.weight_averaging import (ExponentialWeightAverager, WeightAverager,
 from .gn import (clone_param_dict, clone_param_dict_from_named_params,
                  compute_gn_step, current_param_dict, line_search_over_direction,
                  sub_param_dict)
-from .utils import (eval, extend_onecycle_total_steps, get_batch,
+from .utils import (atomic_torch_save, eval, extend_onecycle_total_steps, get_batch,
                     get_parameter_norms, load_checkpoint, load_worker_state,
                     log_prodigy_lr, save_checkpoint, save_worker_state,
                     visualize_routing)
@@ -52,6 +55,15 @@ def _all_gather_object(distributed_backend, value):
     if distributed_backend.get_world_size() == 1:
         return [value]
     raise RuntimeError("Distributed backend does not provide all_gather_object().")
+
+
+def _distributed_reduce_mean(distributed_backend, value):
+    reduce_mean = getattr(distributed_backend, "reduce_mean", None)
+    if reduce_mean is not None:
+        return reduce_mean(value)
+    if distributed_backend.get_world_size() == 1:
+        return value
+    raise RuntimeError("Distributed backend does not provide reduce_mean().")
 
 
 def _run_synchronized_action(
@@ -232,6 +244,16 @@ def _should_run_eval(curr_iter, cfg):
     )
 
 
+def _is_schedulefree(cfg):
+    return cfg.opt in {"sf-sgd", "sf-adamw"}
+
+
+def _enter_train_mode(model, opt, cfg):
+    model.train()
+    if _is_schedulefree(cfg):
+        opt.train()
+
+
 def _clip_grad_norm(model, cfg):
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         return torch.nn.utils.clip_grad_norm_(
@@ -333,6 +355,16 @@ def _should_log_train_step(curr_iter, cfg, distributed_backend):
     )
 
 
+def _metric_to_float(value):
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "item"):
+        value = value.item()
+    return float(value)
+
+
 def _log_training_step(
     curr_iter,
     model,
@@ -351,11 +383,12 @@ def _log_training_step(
     use_gn,
     gn_step_size,
 ):
-    train_loss = loss.detach().cpu().item() * cfg.acc_steps
-    if use_gn:
-        train_loss = loss.detach().cpu().item()
+    train_loss = _metric_to_float(loss)
     last_train_loss = train_loss
-    train_aux_losses = {f"train/{k}": v for k, v in outputs["aux_losses"].items()}
+    train_aux_losses = {
+        f"train/{k}": _metric_to_float(v)
+        for k, v in outputs["aux_losses"].items()
+    }
 
     current_lrs = [param_group["lr"] for param_group in opt.param_groups]
     last_lr = current_lrs[0]
@@ -403,7 +436,10 @@ def _log_training_step(
             model_norm = get_parameter_norms(raw_model, order=cfg.norm_order)
             wandb_logs["model_norm"] = model_norm
 
-        wandb.log(wandb_logs)
+        try:
+            wandb.log(wandb_logs)
+        except Exception as exc:
+            print(f"Warning: training telemetry failed: {exc}")
 
     return last_train_loss, last_lr, []
 
@@ -448,8 +484,9 @@ def _run_weight_average_evals(
     distributed_backend,
     cfg,
 ):
+    evaluation_counts = {}
     if curr_iter > cfg.wa_interval and cfg.weight_average:
-        eval_wa(
+        counts = eval_wa(
             curr_iter,
             not_compiled_model,
             weight_averager,
@@ -459,9 +496,11 @@ def _run_weight_average_evals(
             cfg,
             full_eval=_is_full_eval(curr_iter, cfg),
         )
+        if counts is not None:
+            evaluation_counts["wa"] = counts
 
     if cfg.exponential_weight_average:
-        eval_ewa(
+        counts = eval_ewa(
             curr_iter,
             not_compiled_model,
             ewa,
@@ -471,6 +510,10 @@ def _run_weight_average_evals(
             cfg,
             full_eval=_is_full_eval(curr_iter, cfg),
         )
+        if counts is not None:
+            evaluation_counts["ewa"] = counts
+
+    return evaluation_counts
 
 
 def _step_weight_averagers(
@@ -481,9 +524,17 @@ def _step_weight_averagers(
     cfg,
 ):
     if cfg.weight_average:
-        weight_averager.step(
+        step_weight_average = lambda: weight_averager.step(
             not_compiled_model, distributed_backend.is_master_process()
         )
+        if weight_averager.publishes_on_next_step():
+            _run_synchronized_action(
+                distributed_backend,
+                "weight-average horizon publish",
+                step_weight_average,
+            )
+        else:
+            step_weight_average()
     if cfg.exponential_weight_average:
         ewa.step(not_compiled_model, distributed_backend.is_master_process())
 
@@ -498,10 +549,15 @@ def _run_accumulation_microsteps(
 ):
     has_precond_flag = hasattr(opt, "precond_flag_for_step")
     precond_flag = opt.precond_flag_for_step() if has_precond_flag else False
-    x = y = outputs = loss = None
+    x = y = outputs = None
+    microstep_losses = []
+    aux_losses = {}
+    local_effective_targets = 0
+    accumulation_batches = []
 
     for microstep_idx in range(cfg.acc_steps):  # gradient accumulation
         x, y = get_batch(train_reader, device=cfg.device)
+        accumulation_batches.append((x, y))
         with type_ctx:
             with distributed_backend.get_context_for_microstep_forward(
                 model=model,
@@ -518,17 +574,202 @@ def _run_accumulation_microsteps(
                 else:
                     outputs = model(x, targets=y, moe=cfg.moe)
 
-        loss = outputs["loss"] / cfg.acc_steps
-        loss.backward()
+        raw_loss = outputs["loss"]
+        (raw_loss / cfg.acc_steps).backward()
+        microstep_losses.append(raw_loss.detach())
+        local_effective_targets += _count_effective_targets(y, cfg)
+        for name, value in outputs["aux_losses"].items():
+            aux_losses.setdefault(name, []).append(value.detach())
 
-    return x, y, outputs, loss, cfg.acc_steps
+    local_loss = _mean_microstep_metrics(microstep_losses)
+    aux_names = sorted(aux_losses)
+    local_metrics = [local_loss]
+    local_metrics.extend(
+        _mean_microstep_metrics(aux_losses[name]) for name in aux_names
+    )
+    local_metrics.append(
+        torch.tensor(float(local_effective_targets), device=cfg.device)
+    )
+    reduced_metrics = _distributed_reduce_mean(
+        distributed_backend,
+        _stack_metrics(local_metrics),
+    )
+    step_loss = reduced_metrics[0]
+    step_aux_losses = {
+        name: reduced_metrics[index + 1]
+        for index, name in enumerate(aux_names)
+    }
+    global_effective_targets = int(
+        round(
+            _metric_to_float(reduced_metrics[-1])
+            * distributed_backend.get_world_size()
+        )
+    )
+    outputs = {
+        "loss": step_loss,
+        "aux_losses": step_aux_losses,
+    }
+    return (
+        x,
+        y,
+        outputs,
+        step_loss,
+        cfg.acc_steps,
+        global_effective_targets,
+        accumulation_batches,
+    )
+
+
+def _mean_microstep_metrics(values):
+    if not values:
+        raise ValueError("cannot average an empty microstep metric list")
+    if hasattr(torch, "stack"):
+        return torch.stack(values).mean()
+    # The behavior harness provides a minimal fake torch without stack().
+    return torch.tensor(values).mean()
+
+
+def _stack_metrics(values):
+    if hasattr(torch, "stack"):
+        return torch.stack(values)
+    return torch.tensor(values)
+
+
+def _count_effective_targets(targets, cfg):
+    try:
+        count = (targets != -1).sum()
+    except (AttributeError, TypeError):
+        # The lightweight behavior harness uses string batches. Production
+        # readers always return tensors, so this preserves the declared shape.
+        return int(cfg.batch_size * cfg.sequence_length)
+    return int(_metric_to_float(count))
+
+
+def _global_effective_target_count(targets, cfg, distributed_backend):
+    local_count = _count_effective_targets(targets, cfg)
+    world_size = distributed_backend.get_world_size()
+    if world_size == 1:
+        return local_count
+    mean_count = _distributed_reduce_mean(
+        distributed_backend,
+        torch.tensor(float(local_count), device=cfg.device)
+    )
+    return int(round(_metric_to_float(mean_count) * world_size))
+
+
+def _global_count_from_local(local_count, cfg, distributed_backend):
+    world_size = distributed_backend.get_world_size()
+    if world_size == 1:
+        return int(local_count)
+    mean_count = _distributed_reduce_mean(
+        distributed_backend,
+        torch.tensor(float(local_count), device=cfg.device),
+    )
+    return int(round(_metric_to_float(mean_count) * world_size))
+
+
+def _count_batch_examples(batch, cfg):
+    shape = getattr(batch, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[0])
+    return int(cfg.batch_size)
+
+
+def _run_sophia_hessian_estimator(
+    model,
+    opt,
+    accumulation_batches,
+    distributed_backend,
+    cfg,
+):
+    mode = getattr(cfg, "sophia_estimator_mode", "legacy_last_microbatch")
+    estimator_batches = (
+        accumulation_batches
+        if mode == "global_accum"
+        else accumulation_batches[-1:]
+    )
+    local_examples = 0
+    local_tokens = 0
+    for estimator_idx, (batch_x, batch_y) in enumerate(estimator_batches):
+        sync_context = (
+            distributed_backend.get_context_for_microstep_forward(
+                model=model,
+                microstep_idx=estimator_idx,
+                gradient_accumulation_steps=len(estimator_batches),
+            )
+            if mode == "global_accum"
+            else nullcontext()
+        )
+        with sync_context:
+            sample_again = model(batch_x, targets=batch_y, get_logits=True)
+            samp_dist = torch.distributions.Categorical(
+                logits=sample_again["logits"]
+            )
+            y_sample = samp_dist.sample()
+            loss_sampled = torch.nn.functional.cross_entropy(
+                sample_again["logits"].view(
+                    -1, sample_again["logits"].size(-1)
+                ),
+                y_sample.view(-1),
+                ignore_index=-1,
+            )
+            (loss_sampled / cfg.acc_steps).backward()
+        local_examples += _count_batch_examples(batch_x, cfg)
+        local_tokens += _count_effective_targets(batch_y, cfg)
+
+    opt.update_hessian()
+    opt.zero_grad(set_to_none=True)
+    model.zero_grad()
+    return {
+        "examples": _global_count_from_local(
+            local_examples, cfg, distributed_backend
+        ),
+        "tokens": _global_count_from_local(local_tokens, cfg, distributed_backend),
+    }
+
+
+def _update_digest_with_tensor(digest, label, tensor):
+    digest.update(label.encode("utf-8"))
+    digest.update(str(tensor.dtype).encode("ascii"))
+    digest.update(repr(tuple(tensor.shape)).encode("ascii"))
+    byte_view = tensor.detach().contiguous().view(torch.uint8).cpu().numpy()
+    digest.update(memoryview(byte_view))
+
+
+def _sophia_rank_state_digest(model, opt, distributed_backend):
+    raw_model = distributed_backend.get_raw_model(model)
+    digest = hashlib.sha256()
+    parameter_names = {id(param): name for name, param in raw_model.named_parameters()}
+    for name, param in sorted(raw_model.named_parameters()):
+        _update_digest_with_tensor(digest, f"model:{name}", param)
+    optimizer_states = []
+    for param, state in opt.state.items():
+        name = parameter_names.get(id(param))
+        if name is None:
+            continue
+        for state_name in ("exp_avg", "hessian"):
+            value = state.get(state_name)
+            if value is not None:
+                optimizer_states.append((name, state_name, value))
+    for name, state_name, value in sorted(
+        optimizer_states, key=lambda item: (item[0], item[1])
+    ):
+        _update_digest_with_tensor(
+            digest, f"optimizer:{name}:{state_name}", value
+        )
+    local_digest = digest.hexdigest()
+    digests = _all_gather_object(distributed_backend, local_digest)
+    if len(set(digests)) != 1:
+        raise RuntimeError(
+            "SophiaG model/optimizer state diverged across ranks: "
+            + ", ".join(digests)
+        )
+    return local_digest
 
 
 def _step_standard_optimizer(opt, scheduler, cfg):
-    if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
-        opt.train()
     opt.step()
-    if cfg.scheduler != "none":
+    if scheduler is not None:
         scheduler.step()
 
 
@@ -558,6 +799,42 @@ def train(
             "Benchmark GN is currently single-rank only; its manually assigned "
             "gradients do not have verified DDP synchronization semantics."
         )
+    sophia_estimator_stats = None
+    if cfg.opt == "sophiag":
+        estimator_semantics = copy.deepcopy(
+            getattr(cfg, "training_semantics", {}).get(
+                "sophia_hessian_estimator", {}
+            )
+        )
+        estimator_mode = getattr(
+            cfg, "sophia_estimator_mode", "legacy_last_microbatch"
+        )
+        if estimator_mode == "global_accum":
+            expected_sophia_bs = (
+                active_world_size * int(cfg.batch_size) * int(cfg.acc_steps)
+            )
+            if int(cfg.sophia_bs) != expected_sophia_bs:
+                raise ValueError(
+                    "global_accum SophiaG requires sophia_bs == "
+                    "world_size * local_batch * local_acc_steps: "
+                    f"received {cfg.sophia_bs}, expected {expected_sophia_bs}."
+                )
+        sophia_estimator_stats = {
+            **estimator_semantics,
+            "mode": estimator_mode,
+            "version": estimator_semantics.get(
+                "version",
+                {
+                    "legacy_last_microbatch": "legacy_last_microbatch_v1",
+                    "global_accum": "global_accum_gnb_v1",
+                }[estimator_mode],
+            ),
+            "refresh_count": 0,
+            "actual_examples": 0,
+            "actual_tokens": 0,
+            "rank_state_consistent": None,
+            "rank_state_digest": None,
+        }
 
     not_compiled_model = model
     if cfg.compile:
@@ -628,15 +905,22 @@ def train(
     else:
         curr_iter, substep = _resume_training_state(*resume_args)
 
-    if distributed_backend.is_master_process() and cfg.log_dynamics:
-        with open(cfg.dynamics_logger_cfg, "r") as f:
-            dlcfg = yaml.safe_load(f)
+    if cfg.log_dynamics:
+        def initialize_dynamics_logger():
+            with open(cfg.dynamics_logger_cfg, "r") as stream:
+                dlcfg = yaml.safe_load(stream)
+            dlogger = DynamicsLogger(
+                model, opt, dlcfg, cfg.results_base_folder, wandb=cfg.wandb
+            )
+            dlogger.iteration = curr_iter
+            return dlogger
 
-        # Hooks into optimizer
-        dlogger = DynamicsLogger(
-            model, opt, dlcfg, cfg.results_base_folder, wandb=cfg.wandb
+        _run_synchronized_action(
+            distributed_backend,
+            "dynamics logger initialization",
+            initialize_dynamics_logger,
+            master_only=True,
         )
-        dlogger.iteration = curr_iter
 
     train_reader, val_reader = datareaders["train"], datareaders["val"]
     train_reader.set_step(substep)
@@ -669,7 +953,7 @@ def train(
     wall_clock_start = time.perf_counter()
     train_step_seconds_total = 0.0
     completed_iterations = 0
-    model.train()
+    _enter_train_mode(model, opt, cfg)
     while curr_iter <= cfg.iterations:
         _save_training_checkpoints(
             model,
@@ -700,8 +984,10 @@ def train(
                     cfg,
                     opt,
                     full_eval=_is_full_eval(curr_iter, cfg),
+                    exp_dir=exp_dir,
+                    manage_modes=False,
                 )
-                _run_weight_average_evals(
+                average_evaluation_counts = _run_weight_average_evals(
                     curr_iter,
                     not_compiled_model,
                     weight_averager,
@@ -711,39 +997,93 @@ def train(
                     distributed_backend,
                     cfg,
                 )
-                return result
+                return result, average_evaluation_counts
 
             with _preserve_rng_state():
-                evaluation_result = _run_synchronized_action(
-                    distributed_backend,
-                    "evaluation",
-                    run_evaluations,
-                    master_only=True,
-                )
+                try:
+                    # Schedule-Free mode changes parameters in place. Every rank
+                    # must execute the same eval/train round-trip even though only
+                    # rank 0 computes validation metrics, otherwise finite-precision
+                    # round-off can leave DDP replicas at different parameter values.
+                    _run_synchronized_action(
+                        distributed_backend,
+                        "enter evaluation mode",
+                        lambda: _enter_eval_mode(model, opt, cfg),
+                    )
+                    evaluation_result = _run_synchronized_action(
+                        distributed_backend,
+                        "evaluation",
+                        run_evaluations,
+                        master_only=True,
+                    )
+                finally:
+                    _run_synchronized_action(
+                        distributed_backend,
+                        "restore training mode",
+                        lambda: _enter_train_mode(model, opt, cfg),
+                    )
             if evaluation_result is None:
                 last_val_loss = last_val_pp = last_val_acc = None
+                evaluation_counts = average_evaluation_counts = None
             else:
+                (
+                    raw_evaluation_result,
+                    average_evaluation_counts,
+                ) = evaluation_result
                 (
                     last_val_loss,
                     last_val_pp,
                     last_val_acc,
-                ) = evaluation_result
+                    evaluation_counts,
+                ) = raw_evaluation_result
             if last_val_loss is not None:
                 stats["val_loss"].append(float(last_val_loss))
                 stats["val_pp"].append(float(last_val_pp))
                 stats["val_acc"].append(float(last_val_acc))
-                stats["validation_records"].append(
-                    {
-                        "iteration": int(curr_iter),
-                        "tokens": int(tokens),
-                        "loss": float(last_val_loss),
-                        "perplexity": float(last_val_pp),
-                        "token_accuracy": float(last_val_acc),
-                    }
-                )
+                validation_record = {
+                    "iteration": int(curr_iter),
+                    "tokens": int(tokens),
+                    "loss": float(last_val_loss),
+                    "perplexity": float(last_val_pp),
+                    "token_accuracy": float(last_val_acc),
+                    **evaluation_counts,
+                }
+                if average_evaluation_counts:
+                    validation_record["weight_average_evaluations"] = copy.deepcopy(
+                        average_evaluation_counts
+                    )
+                stats["validation_records"].append(validation_record)
             # eval_and_log/eval_wa/eval_ewa are master-only. Keep every rank at
             # the same control-flow point before another training collective.
             _distributed_barrier(distributed_backend)
+
+        notify_interval = getattr(cfg, "notify_interval", 0)
+        if (
+            curr_iter > 0
+            and completed_iterations > 0
+            and notify_interval
+            and notify_interval > 0
+            and curr_iter % notify_interval == 0
+        ):
+            _run_synchronized_action(
+                distributed_backend,
+                "training progress notification",
+                lambda: _notify_training_progress(
+                    curr_iter,
+                    epoch,
+                    exp_dir,
+                    opt,
+                    distributed_backend,
+                    cfg,
+                    last_train_loss,
+                    last_val_loss,
+                    last_val_pp,
+                    last_val_acc,
+                    last_lr,
+                    last_iter_dt,
+                ),
+                master_only=True,
+            )
 
         if curr_iter == cfg.iterations:
             # Save checkpoints and evaluate at final iteration, but no need to train further
@@ -752,15 +1092,18 @@ def train(
         # Train model
         t_start = time.perf_counter_ns()
         gn_step_size = None
+        step_effective_targets = None
         if use_gn:
             raw_model = distributed_backend.get_raw_model(model)
             gn_mode = "full" if cfg.opt == "gn-full" else "prox"
             params = current_param_dict(raw_model)
             params0 = clone_param_dict(raw_model)
             gn_metrics = None
+            gn_effective_targets = 0
 
             for inner_idx in range(cfg.gn_inner_iters):
                 x, y = get_batch(train_reader, device=cfg.device)
+                gn_effective_targets += _count_effective_targets(y, cfg)
                 with type_ctx:
                     grads, gn_metrics = compute_gn_step(
                         model=raw_model,
@@ -810,6 +1153,10 @@ def train(
                     get_batch(train_reader, device=cfg.device)
                     for _ in range(cfg.gn_inner_iters)
                 ]
+                gn_effective_targets += sum(
+                    _count_effective_targets(batch_y, cfg)
+                    for _batch_x, batch_y in line_search_batches
+                )
                 substep += len(line_search_batches)
                 gn_step_size, _ = line_search_over_direction(
                     model=raw_model,
@@ -821,13 +1168,22 @@ def train(
                 )
 
             loss = torch.tensor(gn_metrics.base_loss, device=cfg.device)
+            step_effective_targets = gn_effective_targets
             outputs = {
                 "loss": loss,
                 "aux_losses": {},
             }
             grad_norms.append(torch.tensor(gn_metrics.gradient_norm))
         else:
-            x, y, outputs, loss, microsteps_run = _run_accumulation_microsteps(
+            (
+                x,
+                y,
+                outputs,
+                loss,
+                microsteps_run,
+                step_effective_targets,
+                accumulation_batches,
+            ) = _run_accumulation_microsteps(
                 model,
                 opt,
                 train_reader,
@@ -854,20 +1210,20 @@ def train(
             if cfg.opt == "sophiag":
                 opt.zero_grad(set_to_none=True)
                 if curr_iter % cfg.precondition_frequency == cfg.precondition_frequency - 1:
-                    sample_again = model(x, targets=y, get_logits=True)
-                    samp_dist = torch.distributions.Categorical(
-                        logits=sample_again["logits"]
+                    estimator_counts = _run_sophia_hessian_estimator(
+                        model,
+                        opt,
+                        accumulation_batches,
+                        distributed_backend,
+                        cfg,
                     )
-                    y_sample = samp_dist.sample()
-                    loss_sampled = torch.nn.functional.cross_entropy(
-                        sample_again["logits"].view(-1, sample_again["logits"].size(-1)),
-                        y_sample.view(-1),
-                        ignore_index=-1,
+                    sophia_estimator_stats["refresh_count"] += 1
+                    sophia_estimator_stats["actual_examples"] += (
+                        estimator_counts["examples"]
                     )
-                    (loss_sampled / cfg.acc_steps).backward()
-                    opt.update_hessian()
-                    opt.zero_grad(set_to_none=True)
-                    model.zero_grad()
+                    sophia_estimator_stats["actual_tokens"] += estimator_counts[
+                        "tokens"
+                    ]
             elif cfg.opt == "mars":
                 opt.zero_grad(set_to_none=True)
                 opt.update_last_grad()
@@ -893,20 +1249,26 @@ def train(
         elapsed_seconds = time.perf_counter() - wall_clock_start
         avg_iter_dt = train_step_seconds_total / max(1, completed_iterations)
         last_iter_dt = dt
+        tokens = ws * substep * cfg.sequence_length * cfg.batch_size
+        epoch = tokens / train_reader.num_tokens
 
         train_loss_value = loss.detach().cpu().item()
-        if not use_gn:
-            train_loss_value *= cfg.acc_steps
+        last_train_loss = float(train_loss_value)
         stats["train_loss"].append(float(train_loss_value))
-        stats["train_records"].append(
-            {
-                "iteration": int(curr_iter),
-                "tokens": int(
-                    ws * substep * cfg.sequence_length * cfg.batch_size
-                ),
-                "loss": float(train_loss_value),
+        train_record = {
+            "iteration": int(curr_iter),
+            "tokens": int(
+                ws * substep * cfg.sequence_length * cfg.batch_size
+            ),
+            "loss": float(train_loss_value),
+            "effective_target_tokens": int(step_effective_targets),
+        }
+        if outputs["aux_losses"]:
+            train_record["aux_losses"] = {
+                name: _metric_to_float(value)
+                for name, value in outputs["aux_losses"].items()
             }
-        )
+        stats["train_records"].append(train_record)
 
         if _should_log_train_step(curr_iter, cfg, distributed_backend):
             last_train_loss, last_lr, grad_norms = _log_training_step(
@@ -927,21 +1289,9 @@ def train(
                 use_gn,
                 gn_step_size,
             )
-
-        _notify_training_progress(
-            curr_iter,
-            epoch,
-            exp_dir,
-            opt,
-            distributed_backend,
-            cfg,
-            last_train_loss,
-            last_val_loss,
-            last_val_pp,
-            last_val_acc,
-            last_lr,
-            last_iter_dt,
-        )
+        # Only rank 0 retains the bounded window needed for periodic telemetry.
+        if not distributed_backend.is_master_process() or not cfg.log_interval:
+            grad_norms = []
 
     stats["wall_clock_seconds"] = time.perf_counter() - wall_clock_start
     stats["train_step_seconds_total"] = train_step_seconds_total
@@ -951,18 +1301,111 @@ def train(
         else 0.0
     )
     stats["completed_iterations"] = completed_iterations
+    if sophia_estimator_stats is not None:
+        if getattr(cfg, "sophia_verify_rank_state", False):
+            sophia_estimator_stats["rank_state_digest"] = (
+                _sophia_rank_state_digest(model, opt, distributed_backend)
+            )
+            sophia_estimator_stats["rank_state_consistent"] = True
+        stats["sophia_estimator"] = sophia_estimator_stats
     return stats
 
 
-def _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval):
+def _get_eval_limits(curr_iter, val_reader, cfg, full_eval):
     if curr_iter != cfg.iterations and not full_eval:
-        return cfg.eval_batches
+        return cfg.eval_batches, None
 
     available_batches = val_reader.num_batches()
     final_eval_batches = getattr(cfg, "final_eval_batches", None)
-    if final_eval_batches is None:
-        return available_batches
-    return min(available_batches, final_eval_batches)
+    max_num_batches = (
+        available_batches
+        if final_eval_batches is None
+        else min(available_batches, final_eval_batches)
+    )
+    return max_num_batches, getattr(cfg, "final_eval_tokens", None)
+
+
+def _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval):
+    max_num_batches, _max_num_tokens = _get_eval_limits(
+        curr_iter, val_reader, cfg, full_eval
+    )
+    return max_num_batches
+
+
+def _evaluation_count_logs(counts, *, final):
+    prefix = "final-val" if final else "val"
+    return {
+        f"{prefix}/evaluated_batches": counts["evaluated_batches"],
+        f"{prefix}/evaluated_tokens": counts["evaluated_tokens"],
+    }
+
+
+def _save_final_evaluation_model(
+    eval_model,
+    cfg,
+    curr_iter,
+    exp_dir,
+    val_loss,
+    val_perplexity,
+    val_acc,
+    evaluation_counts,
+):
+    if (
+        exp_dir is None
+        or curr_iter != cfg.iterations
+        or not (
+            _is_schedulefree(cfg)
+            or getattr(cfg, "save_final_model", False)
+        )
+    ):
+        return
+    evaluation_protocol = copy.deepcopy(
+        getattr(cfg, "evaluation_protocol", None)
+    )
+    payload = {
+        "checkpoint_kind": "llm-optimizer-benchmark-evaluation-model",
+        "format_version": 1,
+        "iteration": int(curr_iter),
+        "optimizer": cfg.opt,
+        "parameterization": (
+            "schedulefree-eval" if _is_schedulefree(cfg) else "train-final"
+        ),
+        "run_identity": copy.deepcopy(getattr(cfg, "run_identity", None)),
+        "evaluation_protocol": evaluation_protocol,
+        "metrics": {
+            "loss": float(val_loss),
+            "perplexity": float(val_perplexity),
+            "token_accuracy": float(val_acc),
+            **copy.deepcopy(evaluation_counts),
+        },
+        "model": eval_model.state_dict(),
+    }
+    exp_dir = Path(exp_dir)
+    protocol_id = (
+        evaluation_protocol.get("identity")
+        if isinstance(evaluation_protocol, dict)
+        else None
+    )
+    if not protocol_id:
+        atomic_torch_save(payload, exp_dir / "model_eval.pt")
+        return
+
+    versioned_path = (
+        exp_dir / "evaluations" / str(protocol_id) / "model_eval.pt"
+    )
+    atomic_torch_save(payload, versioned_path)
+
+    # Keep the legacy root path as an atomic latest alias without serializing
+    # the potentially large model twice. Both paths remain on the same run fs.
+    latest_path = exp_dir / "model_eval.pt"
+    temporary_link = exp_dir / f".model_eval.pt.{uuid.uuid4().hex}"
+    try:
+        os.link(versioned_path, temporary_link)
+        temporary_link.replace(latest_path)
+    except OSError:
+        if temporary_link.exists():
+            temporary_link.unlink()
+        atomic_torch_save(payload, latest_path)
 
 
 def _build_eval_logs(
@@ -972,16 +1415,19 @@ def _build_eval_logs(
     val_perplexity,
     val_acc,
     val_aux_losses,
+    evaluation_counts,
     cfg,
     full_eval,
 ):
-    if curr_iter == cfg.iterations or full_eval:
+    final = curr_iter == cfg.iterations or full_eval
+    if final:
         return {
             "tokens": tokens,
             "iter": curr_iter,
             "final-val/loss": val_loss,
             "final-val/perplexity": val_perplexity,
             "final-val/acc": val_acc,
+            **_evaluation_count_logs(evaluation_counts, final=True),
             **val_aux_losses,
         }
     return {
@@ -990,6 +1436,7 @@ def _build_eval_logs(
         "val/loss": val_loss,
         "val/perplexity": val_perplexity,
         "val/acc": val_acc,
+        **_evaluation_count_logs(evaluation_counts, final=False),
         **val_aux_losses,
     }
 
@@ -1026,12 +1473,8 @@ def _maybe_log_generated_text(
 
 def _enter_eval_mode(model, opt, cfg):
     model.eval()
-    if cfg.opt == "sf-sgd" or cfg.opt == "sf-adamw":
+    if _is_schedulefree(cfg):
         opt.eval()
-
-
-def _restore_train_mode(model):
-    model.train()
 
 
 def eval_and_log(
@@ -1045,55 +1488,84 @@ def eval_and_log(
     cfg,
     opt,
     full_eval=False,
+    exp_dir=None,
+    manage_modes=True,
 ):
     if not distributed_backend.is_master_process():
         # Only evaluate and log on master rank
-        return None, None, None
+        return None, None, None, None
 
-    _enter_eval_mode(model, opt, cfg)
+    try:
+        if manage_modes:
+            _enter_eval_mode(model, opt, cfg)
+        max_num_batches, max_num_tokens = _get_eval_limits(
+            curr_iter, val_reader, cfg, full_eval
+        )
 
-    max_num_batches = _get_eval_batch_count(curr_iter, val_reader, cfg, full_eval)
+        # to make sure we start from the beginning of the validation set,
+        # i.e. repeat the same batches
+        val_reader.set_step(0)
+        eval_model = distributed_backend.get_raw_model(model)
+        (
+            val_acc,
+            val_loss,
+            val_perplexity,
+            val_aux_losses,
+            router_logits,
+            evaluation_counts,
+        ) = eval(
+            eval_model,
+            val_reader,
+            cfg.device,
+            max_num_batches=max_num_batches,
+            max_num_tokens=max_num_tokens,
+            ctx=type_ctx,
+            moe=cfg.moe,
+            get_router_logits=cfg.moe and cfg.plot_router_logits,
+            cfg=cfg,
+            return_counts=True,
+        )
 
-    # to make sure we start from the beginning of the validation set,
-    # i.e. repeat the same batches
-    val_reader.set_step(0)
-    val_acc, val_loss, val_perplexity, val_aux_losses, router_logits = eval(
-        model,
-        val_reader,
-        cfg.device,
-        max_num_batches=max_num_batches,
-        ctx=type_ctx,
-        moe=cfg.moe,
-        get_router_logits=cfg.moe and cfg.plot_router_logits,
-        cfg=cfg,
-    )
+        print(
+            f">Eval: Iter={curr_iter} ({epoch:0.3f} epochs) "
+            f"val_loss={val_loss:.3f} "
+            f"val_pp={val_perplexity:.3f} "
+            f"val_acc={val_acc:3f}"
+        )
 
-    print(
-        f">Eval: Iter={curr_iter} ({epoch:0.3f} epochs) "
-        f"val_loss={val_loss:.3f} "
-        f"val_pp={val_perplexity:.3f} "
-        f"val_acc={val_acc:3f}"
-    )
-
-    if cfg.wandb:
-        logs = _build_eval_logs(
-            tokens,
+        _save_final_evaluation_model(
+            eval_model,
+            cfg,
             curr_iter,
+            exp_dir,
             val_loss,
             val_perplexity,
             val_acc,
-            val_aux_losses,
-            cfg,
-            full_eval,
+            evaluation_counts,
         )
-        logs = _add_router_logs(logs, router_logits, cfg)
-        wandb.log(logs)
-        _maybe_log_generated_text(
-            curr_iter,
-            val_perplexity,
-            model,
-            distributed_backend,
-            cfg,
-        )
-    _restore_train_mode(model)
-    return val_loss, val_perplexity, val_acc
+
+        if cfg.wandb:
+            logs = _build_eval_logs(
+                tokens,
+                curr_iter,
+                val_loss,
+                val_perplexity,
+                val_acc,
+                val_aux_losses,
+                evaluation_counts,
+                cfg,
+                full_eval,
+            )
+            logs = _add_router_logs(logs, router_logits, cfg)
+            wandb.log(logs)
+            _maybe_log_generated_text(
+                curr_iter,
+                val_perplexity,
+                model,
+                distributed_backend,
+                cfg,
+            )
+        return val_loss, val_perplexity, val_acc, evaluation_counts
+    finally:
+        if manage_modes:
+            _enter_train_mode(model, opt, cfg)

@@ -8,10 +8,66 @@ from tqdm import tqdm
 tknzr = tiktoken.get_encoding("gpt2")
 
 
-def get_fineweb_data(datasets_dir, num_proc=40):
-    """To change the cache dir, run `export HF_HOME=/path/to/cache/` before running the code."""
-    FWEB_DATA_PATH = os.path.join(datasets_dir, "fineweb-100BT/")
-    if not os.path.exists(os.path.join(FWEB_DATA_PATH, "train.bin")):
+def _is_valid_token_bin(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0 and os.path.getsize(path) % 2 == 0
+
+
+def _has_fineweb_bins(path):
+    return _is_valid_token_bin(os.path.join(path, "train.bin")) and _is_valid_token_bin(
+        os.path.join(path, "val.bin")
+    )
+
+
+def _resolve_existing_fineweb_path(datasets_dir):
+    candidates = [
+        datasets_dir,
+        os.path.join(datasets_dir, "fineweb-30B"),
+        os.path.join(datasets_dir, "fineweb-100BT"),
+    ]
+    seen = set()
+    for path in candidates:
+        path = os.path.abspath(os.path.expanduser(path))
+        if path in seen:
+            continue
+        seen.add(path)
+        if _has_fineweb_bins(path):
+            return path
+    return None
+
+
+def get_fineweb_data(datasets_dir, num_proc=40, *, allow_download=False):
+    """Return existing FineWeb binaries or explicitly build the legacy sample.
+
+    Dataset discovery is read-only. Missing data fails closed unless the caller
+    explicitly opts in with ``allow_download=True``. The legacy
+    ``LLMOPT_FINEWEB_NO_DOWNLOAD=1`` guard remains a final safety override for
+    existing deployment scripts.
+    """
+    existing_path = _resolve_existing_fineweb_path(datasets_dir)
+    if existing_path is not None:
+        return {
+            "train": os.path.join(existing_path, "train.bin"),
+            "val": os.path.join(existing_path, "val.bin"),
+        }
+
+    downloads_disabled = os.environ.get("LLMOPT_FINEWEB_NO_DOWNLOAD") == "1"
+    if not allow_download or downloads_disabled:
+        expected = [
+            os.path.join(datasets_dir, "train.bin"),
+            os.path.join(datasets_dir, "fineweb-30B", "train.bin"),
+            os.path.join(datasets_dir, "fineweb-100BT", "train.bin"),
+        ]
+        raise FileNotFoundError(
+            "FineWeb train.bin/val.bin not found. Checked the direct directory, "
+            "fineweb-30B/, and fineweb-100BT/. Training does not download data "
+            "by default; set --datasets_dir or LLMOPT_DATASETS_DIR to existing "
+            "data. To intentionally build the legacy sample-100BT, pass "
+            "--allow_dataset_download. LLMOPT_FINEWEB_NO_DOWNLOAD=1 always "
+            f"disables downloads. Example train paths: {expected}"
+        )
+
+    FWEB_DATA_PATH = os.path.join(datasets_dir, "fineweb-100BT")
+    if not _has_fineweb_bins(FWEB_DATA_PATH):
         os.makedirs(FWEB_DATA_PATH, exist_ok=True)
 
         dataset = load_dataset(
@@ -73,4 +129,4 @@ def get_fineweb_data(datasets_dir, num_proc=40):
 
 
 if __name__ == "__main__":
-    get_fineweb_data("./datasets/")
+    get_fineweb_data("./datasets/", allow_download=True)

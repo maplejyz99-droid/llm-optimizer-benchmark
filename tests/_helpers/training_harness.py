@@ -58,6 +58,9 @@ class FakeTensorList:
         ]
         return FakeScalar(sum(raw_values) / len(raw_values))
 
+    def __getitem__(self, index):
+        return self.values[index]
+
 
 class FakeLogits:
     def __init__(self, events):
@@ -85,6 +88,9 @@ class FakeTrainingModel:
 
     def parameters(self):
         return [self.parameter_source]
+
+    def state_dict(self):
+        return {"weight": "fake-model-weight"}
 
     def zero_grad(self):
         self.events.append(("model.zero_grad",))
@@ -211,6 +217,17 @@ class FakeDistributedBackendForTrain:
         self.events.append(("all_gather_object", value))
         return [value] * self.world_size
 
+    def reduce_mean(self, value):
+        if hasattr(value, "item"):
+            recorded = value.item()
+        else:
+            recorded = tuple(
+                item.item() if hasattr(item, "item") else float(item)
+                for item in value.values
+            )
+        self.events.append(("reduce_mean", recorded))
+        return value
+
     def get_context_for_microstep_forward(
         self, model, microstep_idx, gradient_accumulation_steps
     ):
@@ -240,6 +257,7 @@ def make_training_cfg(**overrides):
         "warmup_steps": 0,
         "eval_interval": 100,
         "eval_batches": 2,
+        "save_final_model": False,
         "full_eval_at": [],
         "permanent_ckpt_interval": 0,
         "latest_ckpt_interval": 0,
@@ -257,6 +275,7 @@ def make_training_cfg(**overrides):
         "results_base_folder": "",
         "wandb": False,
         "log_interval": 0,
+        "notify_interval": 1,
         "log_parameter_norms": False,
         "norm_order": 2,
         "eval_seq_prefix": "none",
@@ -267,6 +286,8 @@ def make_training_cfg(**overrides):
         "gn_linesearch": False,
         "gn_ls_range": [1.0],
         "sophia_bs": 1,
+        "sophia_estimator_mode": "legacy_last_microbatch",
+        "sophia_verify_rank_state": False,
         "precondition_frequency": 10,
         "metric_semantics": {
             "validation_loss": "next_token_cross_entropy",
@@ -327,6 +348,8 @@ def make_training_replacements(capture):
     class FakeDynamicsLogger:
         def __init__(self, *args, **kwargs):
             events.append(("dynamics_logger.init",))
+            if "dynamics_logger_error" in capture:
+                raise capture["dynamics_logger_error"]
             self.iteration = 0
 
     logger_module.DynamicsLogger = FakeDynamicsLogger
@@ -340,6 +363,8 @@ def make_training_replacements(capture):
 
     class FakeWeightAverager:
         def __init__(self, model, **kwargs):
+            self.horizon = kwargs["horizon"]
+            self.count = kwargs["count"]
             save_dir = kwargs["save_dir"]
             events.append(
                 (
@@ -358,6 +383,16 @@ def make_training_replacements(capture):
 
         def step(self, model, is_master):
             events.append(("weight_averager.step", is_master))
+            self.count += 1
+            if (
+                is_master
+                and self.count % self.horizon == 0
+                and "weight_averager_publish_error" in capture
+            ):
+                raise capture["weight_averager_publish_error"]
+
+        def publishes_on_next_step(self):
+            return (self.count + 1) % self.horizon == 0
 
     class FakeExponentialWeightAverager:
         def __init__(self, model, **kwargs):
@@ -378,9 +413,11 @@ def make_training_replacements(capture):
 
     def fake_eval_wa(curr_iter, *args, **kwargs):
         events.append(("eval_wa", curr_iter, kwargs.get("full_eval")))
+        return capture.get("wa_evaluation_counts")
 
     def fake_eval_ewa(curr_iter, *args, **kwargs):
         events.append(("eval_ewa", curr_iter, kwargs.get("full_eval")))
+        return capture.get("ewa_evaluation_counts")
 
     weight_averaging_module.WeightAverager = FakeWeightAverager
     weight_averaging_module.ExponentialWeightAverager = FakeExponentialWeightAverager
@@ -435,20 +472,47 @@ def make_training_replacements(capture):
         moe,
         get_router_logits,
         cfg,
+        max_num_tokens=None,
+        return_counts=False,
     ):
-        events.append(("eval", max_num_batches, moe, get_router_logits))
+        events.append(
+            (
+                "eval",
+                max_num_batches,
+                moe,
+                get_router_logits,
+                max_num_tokens,
+            )
+        )
         if "eval_error" in capture:
             raise capture["eval_error"]
         if capture.get("eval_consumes_rng"):
             capture["torch_rng_state"]["value"] += 1
             random.random()
             np.random.random()
-        return (
+        result = (
             0.75,
             1.25,
             2.5,
             capture.get("eval_aux_losses", {}),
             capture.get("router_logits", []),
+        )
+        if not return_counts:
+            return result
+        evaluated_batches = max_num_batches
+        targets_per_batch = cfg.batch_size * cfg.sequence_length
+        evaluated_tokens = evaluated_batches * targets_per_batch
+        if max_num_tokens is not None:
+            evaluated_batches = min(
+                evaluated_batches,
+                (max_num_tokens + targets_per_batch - 1) // targets_per_batch,
+            )
+            evaluated_tokens = min(evaluated_tokens, max_num_tokens)
+        return result + (
+            {
+                "evaluated_batches": evaluated_batches,
+                "evaluated_tokens": evaluated_tokens,
+            },
         )
 
     def fake_save_checkpoint(
@@ -504,6 +568,18 @@ def make_training_replacements(capture):
 
     utils_module.get_batch = fake_get_batch
     utils_module.eval = fake_eval
+    def fake_atomic_torch_save(payload, path):
+        events.append(
+            (
+                "atomic_torch_save",
+                Path(path).as_posix(),
+                payload.get("checkpoint_kind"),
+                payload.get("parameterization"),
+                dict(payload.get("metrics", {})),
+            )
+        )
+
+    utils_module.atomic_torch_save = fake_atomic_torch_save
     utils_module.save_checkpoint = fake_save_checkpoint
     utils_module.save_worker_state = fake_save_worker_state
     def fake_load_checkpoint(

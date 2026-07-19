@@ -36,9 +36,17 @@ from optim.sign import Signum
 from optim.soap import SOAP
 from optim.experimental.softeq_muon import SoftEqK2000Muon
 from optim.sophia import SophiaG
-from run_manifest import (build_data_manifest, build_run_manifest,
-                          collect_runtime_identity, ensure_compatible_manifest,
-                          sanitized_config, write_json_atomic)
+from run_manifest import (
+    build_data_manifest,
+    build_evaluation_protocol,
+    build_run_manifest,
+    collect_runtime_identity,
+    reconcile_run_manifest,
+    require_resolved_run_manifest,
+    resolve_optimization_plan,
+    sanitized_config,
+    write_json_atomic,
+)
 
 
 def _run_synchronized_action(
@@ -82,6 +90,21 @@ def _run_synchronized_action(
             f"{first['type']}: {first['message']}"
         )
     return result
+
+
+def _require_consistent_distributed_value(distributed_backend, label, value):
+    gather = getattr(distributed_backend, "all_gather_object", None)
+    if gather is None:
+        if distributed_backend.get_world_size() != 1:
+            raise RuntimeError(
+                "Distributed backend does not provide all_gather_object()."
+            )
+        values = [value]
+    else:
+        values = gather(value)
+    if any(candidate != values[0] for candidate in values[1:]):
+        raise RuntimeError(f"{label} differs across distributed ranks.")
+    return values[0]
 
 
 MUON_SCHEDULER_OPTS = {"muon", "muon-magma", "newton-muon", "softeq-k2000-muon"}
@@ -380,7 +403,7 @@ def build_optimizer(args, model, group_specs, magma_param_ids):
             optimize_1d=False,  # we set in order to optimize 1D parameters with AdamW
             lr_1d=args.lr,  # AdamW's lr when optimize_1d=False
             betas_1d=(args.beta1, args.beta2),  # AdamW's betas when optimize_1d=False
-            weight_decay_1d=0.1,  # AdamW's weight decay
+            weight_decay_1d=args.weight_decay,  # AdamW's weight decay
         )
     elif args.opt == "adafactor":
         return Adafactor(
@@ -453,6 +476,11 @@ def uses_combined_scheduler(args):
 
 
 def build_scheduler(args, opt, group_specs):
+    if args.opt == "adafactor":
+        # Adafactor is configured with relative_step=True, so its learning-rate
+        # schedule is owned by the optimizer and no external scheduler state
+        # should be created or checkpointed.
+        return None
     if args.scheduler == "none":
         return None
 
@@ -580,9 +608,16 @@ def main(args, parser):
     args.run_seed = args.seed
     distributed_backend = distributed.make_backend_from_args(args)
     try:
-        return _main_with_backend(args, parser, distributed_backend)
-    finally:
+        result = _main_with_backend(args, parser, distributed_backend)
+    except BaseException as primary_error:
+        try:
+            distributed_backend.finalize()
+        except BaseException as finalize_error:
+            raise primary_error from finalize_error
+        raise
+    else:
         distributed_backend.finalize()
+        return result
 
 
 def _main_with_backend(args, parser, distributed_backend):
@@ -627,12 +662,95 @@ def _main_with_backend(args, parser, distributed_backend):
 
     exp_name = get_exp_name(args, parser, distributed_backend)
     exp_dir = Path(args.results_base_folder) / exp_name
+    manifest_path = exp_dir / "run_manifest.json"
+    latest_ckpt_dir = exp_dir / "ckpts" / "latest"
 
     print(f"Starting Experiment: {exp_name}")
     print(f"Experiment Directory: {exp_dir}")
 
+    completed_summary_exists = _require_consistent_distributed_value(
+        distributed_backend,
+        "Completed summary availability",
+        (exp_dir / "summary.json").is_file(),
+    )
+    versioned_summary_exists = _require_consistent_distributed_value(
+        distributed_backend,
+        "Versioned evaluation summary availability",
+        any(
+            path.is_file()
+            for path in (exp_dir / "evaluations").glob("*/summary.json")
+        ),
+    )
+    if completed_summary_exists or versioned_summary_exists:
+        raise ValueError(
+            f"The experiment dir {exp_dir} already has a completed summary "
+            "artifact and cannot be resumed or overwritten."
+        )
+    latest_checkpoint_exists = _require_consistent_distributed_value(
+        distributed_backend,
+        "Latest checkpoint availability",
+        (latest_ckpt_dir / "main.pt").is_file(),
+    )
+    if latest_checkpoint_exists and args.resume_from is None:
+        if not args.auto_resume:
+            raise ValueError(
+                f"The experiment dir {exp_dir} already has a checkpoint. "
+                "To resume training, set auto_resume=True. Otherwise, "
+                "specify a different experiment name."
+            )
+        args.resume_from = str(latest_ckpt_dir)
+    resume_source = _require_consistent_distributed_value(
+        distributed_backend,
+        "Resume source",
+        args.resume_from,
+    )
+    if resume_source is not None:
+        expected_resume_path = latest_ckpt_dir.resolve(strict=False)
+        actual_resume_path = Path(resume_source).expanduser().resolve(strict=False)
+        if actual_resume_path != expected_resume_path:
+            raise ValueError(
+                "--resume_from may only point to this run's ckpts/latest "
+                f"directory: expected {expected_resume_path}, got "
+                f"{actual_resume_path}."
+            )
+        if not latest_checkpoint_exists:
+            raise ValueError(
+                "--resume_from requires this run's ckpts/latest/main.pt."
+            )
+        existing_manifest = _run_synchronized_action(
+            distributed_backend,
+            "resume manifest validation",
+            lambda: require_resolved_run_manifest(manifest_path),
+        )
+        current_protocol = _run_synchronized_action(
+            distributed_backend,
+            "requested evaluation protocol construction",
+            lambda: build_evaluation_protocol(args),
+        )
+        existing_protocol = existing_manifest.get("evaluation_protocol", {})
+        existing_protocol_identity = _require_consistent_distributed_value(
+            distributed_backend,
+            "Existing evaluation protocol identity",
+            existing_protocol.get("identity"),
+        )
+        current_protocol_identity = _require_consistent_distributed_value(
+            distributed_backend,
+            "Requested evaluation protocol identity",
+            current_protocol["identity"],
+        )
+        if existing_protocol_identity != current_protocol_identity:
+            raise ValueError(
+                "Existing resolved evaluation protocol identity does not match "
+                "the requested evaluation settings; resume with the original "
+                "settings or choose a different experiment directory."
+            )
+
     print(f"Loading dataset: '{args.dataset}'")
-    datareaders = get_data_readers(args)
+    datareaders = _run_synchronized_action(
+        distributed_backend,
+        "data reader initialization",
+        lambda: get_data_readers(args),
+    )
     data_manifest = datareaders.get("_data_manifest")
     if data_manifest is None:
         data_manifest = build_data_manifest(args.dataset, {})
@@ -642,67 +760,31 @@ def _main_with_backend(args, parser, distributed_backend):
             "version": str(torch.__version__),
             "cuda": str(getattr(getattr(torch, "version", None), "cuda", None)),
         }
-    run_manifest = build_run_manifest(
+    preflight_manifest = build_run_manifest(
         args,
         data_manifest,
         runtime=runtime_identity,
     )
-    args.run_identity = run_manifest["run_identity"]
-    args.metric_semantics = run_manifest["metric_semantics"]
-
-    latest_ckpt_dir = exp_dir / "ckpts" / "latest"
-    if (latest_ckpt_dir / "main.pt").exists() and args.resume_from is None:
-        if not args.auto_resume:
-            raise ValueError(
-                f"The experiment dir {exp_dir} already exists. "
-                + "To resume training, set auto_resume=True. "
-                + "Otherwise, specify a different experiment name. "
-            )
-        args.resume_from = str(latest_ckpt_dir)
-
-    _run_synchronized_action(
+    _require_consistent_distributed_value(
         distributed_backend,
-        "experiment directory creation",
-        lambda: exp_dir.mkdir(parents=True, exist_ok=True),
-        master_only=True,
+        "Preflight identity",
+        preflight_manifest["preflight_identity"],
     )
+    args.metric_semantics = preflight_manifest["metric_semantics"]
+    args.evaluation_protocol = preflight_manifest["evaluation_protocol"]
+    args.training_semantics = preflight_manifest["training_semantics"]
 
-    distributed_backend.barrier()
-    manifest_path = exp_dir / "run_manifest.json"
     _run_synchronized_action(
         distributed_backend,
-        "run manifest compatibility check",
-        lambda: ensure_compatible_manifest(manifest_path, run_manifest),
-    )
-    _run_synchronized_action(
-        distributed_backend,
-        "run manifest write",
-        lambda: write_json_atomic(manifest_path, run_manifest),
+        "run manifest preflight reconciliation",
+        lambda: reconcile_run_manifest(
+            manifest_path,
+            preflight_manifest,
+            phase="preflight",
+        ),
         master_only=True,
     )
     distributed_backend.barrier()
-
-    public_config = sanitized_config(args)
-    print(f"Config:\n{public_config}\n")
-    if args.wandb:
-        def initialize_wandb():
-            wandb.init(
-                project=args.wandb_project,
-                name=exp_name,
-                config=public_config,
-                entity=args.wandb_entity,
-            )
-            wandb.define_metric("iter")
-            wandb.define_metric("train/*", step_metric="iter")
-            wandb.define_metric("val/*", step_metric="iter")
-            wandb.define_metric("lr", step_metric="iter")
-
-        _run_synchronized_action(
-            distributed_backend,
-            "W&B initialization",
-            initialize_wandb,
-            master_only=True,
-        )
 
     model = _run_synchronized_action(
         distributed_backend,
@@ -721,52 +803,82 @@ def _main_with_backend(args, parser, distributed_backend):
         print("GN mode: force math SDP backend for forward-AD compatibility.")
     print(f"\nModel:\n{model}")
 
-    model = distributed_backend.transform_model(model)
-
-    group_specs = distributed_backend.get_raw_model(model).get_parameter_group_specs(
-        config=args
+    model = _run_synchronized_action(
+        distributed_backend,
+        "distributed model transformation",
+        lambda: distributed_backend.transform_model(model),
     )
-    param_name_mapping = {p_name: p for p_name, p in model.named_parameters()}
-    param_to_name = {}
-    magma_param_ids = set()
 
-    def use_magma_for_param(param_name):
-        if args.magma_scope == "all":
-            return True
-        lowered = param_name.lower()
-        return ("attn" in lowered) or ("mlp" in lowered)
-    optimized_params_cnt = 0
-    for g in group_specs:
-        params = []
-        for p_name in g["params"]:
-            translated_p_names = (
-                distributed_backend.translate_model_parameter_name_for_node(p_name)
+    def prepare_parameter_groups():
+        raw_model = distributed_backend.get_raw_model(model)
+        group_specs = raw_model.get_parameter_group_specs(config=args)
+        param_name_mapping = {
+            parameter_name: parameter
+            for parameter_name, parameter in model.named_parameters()
+        }
+        param_to_name = {}
+        magma_param_ids = set()
+
+        def use_magma_for_param(parameter_name):
+            if args.magma_scope == "all":
+                return True
+            lowered = parameter_name.lower()
+            return ("attn" in lowered) or ("mlp" in lowered)
+
+        optimized_params_cnt = 0
+        for group in group_specs:
+            parameters = []
+            for parameter_name in group["params"]:
+                translated_names = (
+                    distributed_backend.translate_model_parameter_name_for_node(
+                        parameter_name
+                    )
+                )
+                for translated_name in translated_names:
+                    parameter = param_name_mapping[translated_name]
+                    parameters.append(parameter)
+                    param_to_name[id(parameter)] = translated_name
+                    if use_magma_for_param(translated_name):
+                        magma_param_ids.add(id(parameter))
+            group["params"] = parameters
+            optimized_params_cnt += sum(
+                parameter.numel() for parameter in parameters
             )
-            for translated_name in translated_p_names:
-                param = param_name_mapping[translated_name]
-                params.append(param)
-                param_to_name[id(param)] = translated_name
-                if use_magma_for_param(translated_name):
-                    magma_param_ids.add(id(param))
-        g["params"] = params
-        optimized_params_cnt += sum([p.numel() for p in g["params"]])
-    raw_model = distributed_backend.get_raw_model(model)
-    params_cnt, nonemb_param_cnt = get_logged_parameter_counts(raw_model)
+        params_cnt, nonemb_param_cnt = get_logged_parameter_counts(raw_model)
+        return (
+            group_specs,
+            param_to_name,
+            magma_param_ids,
+            optimized_params_cnt,
+            raw_model,
+            params_cnt,
+            nonemb_param_cnt,
+        )
+
+    (
+        group_specs,
+        param_to_name,
+        magma_param_ids,
+        optimized_params_cnt,
+        raw_model,
+        params_cnt,
+        nonemb_param_cnt,
+    ) = _run_synchronized_action(
+        distributed_backend,
+        "optimizer parameter-group assembly",
+        prepare_parameter_groups,
+    )
     print("number of parameters: %.2fM" % (params_cnt / 1e6,))
     print("number of optimized parameters: %.2fM" % (optimized_params_cnt / 1e6,))
     print("number of non-embedding parameters: %.2fM" % (nonemb_param_cnt / 1e6,))
-    if args.wandb and distributed_backend.is_master_process():
-        wandb.log(
-            {
-                "parameters": params_cnt,
-                "optimized_parameters": optimized_params_cnt,
-                "non_embedding_parameters": nonemb_param_cnt,
-            }
-        )
 
     args.world_size = distributed_backend.get_world_size()
 
-    opt = build_optimizer(args, model, group_specs, magma_param_ids)
+    opt = _run_synchronized_action(
+        distributed_backend,
+        "optimizer construction",
+        lambda: build_optimizer(args, model, group_specs, magma_param_ids),
+    )
     print(f"\nOptimizer:\n{opt}")
     if args.log_optimizer_groups:
         log_optimizer_groups(opt, param_to_name, "before scheduler")
@@ -778,9 +890,83 @@ def _main_with_backend(args, parser, distributed_backend):
             f"tau={args.magma_tau}, beta={args.magma_beta})"
         )
 
-    scheduler = build_scheduler(args, opt, group_specs)
+    resolved_plan = _run_synchronized_action(
+        distributed_backend,
+        "optimization plan resolution",
+        lambda: resolve_optimization_plan(
+            preflight_manifest["optimization_plan"],
+            opt,
+            raw_model.named_parameters(),
+            overlay_param_ids={"magma_modifier": magma_param_ids}
+            if "magma" in args.opt
+            else None,
+        ),
+    )
+    run_manifest = build_run_manifest(
+        args,
+        data_manifest,
+        code=preflight_manifest["code"],
+        runtime=preflight_manifest["runtime"],
+        optimization_plan=resolved_plan,
+    )
+    _require_consistent_distributed_value(
+        distributed_backend,
+        "Resolved run identity",
+        run_manifest["run_identity"],
+    )
+    _run_synchronized_action(
+        distributed_backend,
+        "resolved run manifest reconciliation",
+        lambda: reconcile_run_manifest(
+            manifest_path,
+            run_manifest,
+            phase="resolved",
+        ),
+        master_only=True,
+    )
+    distributed_backend.barrier()
+
+    args.run_identity = run_manifest["run_identity"]
+    args.metric_semantics = run_manifest["metric_semantics"]
+    args.evaluation_protocol = run_manifest["evaluation_protocol"]
+    args.training_semantics = run_manifest["training_semantics"]
+
+    scheduler = _run_synchronized_action(
+        distributed_backend,
+        "scheduler construction",
+        lambda: build_scheduler(args, opt, group_specs),
+    )
     if args.log_optimizer_groups:
         log_optimizer_groups(opt, param_to_name, "after scheduler init")
+
+    public_config = sanitized_config(args)
+    print(f"Config:\n{public_config}\n")
+    if args.wandb:
+        def initialize_wandb():
+            wandb.init(
+                project=args.wandb_project,
+                name=exp_name,
+                config=public_config,
+                entity=args.wandb_entity,
+            )
+            wandb.define_metric("iter")
+            wandb.define_metric("train/*", step_metric="iter")
+            wandb.define_metric("val/*", step_metric="iter")
+            wandb.define_metric("lr", step_metric="iter")
+            wandb.log(
+                {
+                    "parameters": params_cnt,
+                    "optimized_parameters": optimized_params_cnt,
+                    "non_embedding_parameters": nonemb_param_cnt,
+                }
+            )
+
+        _run_synchronized_action(
+            distributed_backend,
+            "W&B initialization",
+            initialize_wandb,
+            master_only=True,
+        )
 
     stats = train(
         model=model,
@@ -794,11 +980,29 @@ def _main_with_backend(args, parser, distributed_backend):
 
     stats["args"] = public_config
     stats["run_identity"] = args.run_identity
+    stats["preflight_identity"] = run_manifest["preflight_identity"]
+    stats["optimization_plan"] = run_manifest["optimization_plan"]
     stats["metric_semantics"] = args.metric_semantics
+    stats["evaluation_protocol"] = args.evaluation_protocol
+    stats["training_semantics"] = args.training_semantics
+
+    evaluation_summary_path = (
+        exp_dir
+        / "evaluations"
+        / args.evaluation_protocol["identity"]
+        / "summary.json"
+    )
+
+    def write_summaries():
+        # Preserve each evaluation protocol independently, then update the
+        # conventional latest-summary path used by existing tooling.
+        write_json_atomic(evaluation_summary_path, stats)
+        write_json_atomic(exp_dir / "summary.json", stats)
+
     _run_synchronized_action(
         distributed_backend,
         "summary write",
-        lambda: write_json_atomic(exp_dir / "summary.json", stats),
+        write_summaries,
         master_only=True,
     )
 
@@ -843,8 +1047,13 @@ def get_exp_name(
     key_args=["model", "dataset", "opt"],
     ignore_args=[
         "eval_interval",
+        "eval_batches",
+        "eval_seq_prefix",
+        "final_eval_batches",
+        "final_eval_tokens",
         "full_eval_at",
         "distributed_backend",
+        "distributed_control_timeout_seconds",
         "latest_ckpt_interval",
         "permanent_ckpt_interval",
         "datasets_dir",
@@ -884,6 +1093,8 @@ def get_exp_name(
         "run_identity",
         "run_seed",
         "metric_semantics",
+        "evaluation_protocol",
+        "training_semantics",
     ],
 ):
     # Set the custom exp name if needed

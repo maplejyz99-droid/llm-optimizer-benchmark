@@ -61,6 +61,7 @@ def make_config(**overrides):
         "iterations": 10,
         "eval_batches": 2,
         "final_eval_batches": 3,
+        "final_eval_tokens": None,
         "device": "cpu",
         "moe": False,
         "wandb": False,
@@ -76,11 +77,16 @@ class FinalEvalBatchCapTest(unittest.TestCase):
     def setUp(self):
         self.averaging = load_weight_averaging_module()
         self.original_eval = self.averaging.eval
-        self.eval_batch_counts = []
+        self.eval_limits = []
 
         def fake_eval(*_args, **kwargs):
-            self.eval_batch_counts.append(kwargs["max_num_batches"])
-            return 0.5, 1.25, 3.5, {}, None
+            self.eval_limits.append(
+                (kwargs["max_num_batches"], kwargs.get("max_num_tokens"))
+            )
+            result = (0.5, 1.25, 3.5, {}, None)
+            if kwargs.get("return_counts"):
+                result += ({"evaluated_batches": 1, "evaluated_tokens": 8},)
+            return result
 
         self.averaging.eval = fake_eval
 
@@ -118,19 +124,27 @@ class FinalEvalBatchCapTest(unittest.TestCase):
         self.run_wa(make_config(wa_sweep_horizon=True))
         self.run_ewa(make_config())
 
-        self.assertEqual(self.eval_batch_counts, [3, 3, 3])
+        self.assertEqual(self.eval_limits, [(3, None), (3, None), (3, None)])
 
     def test_full_eval_uses_cap_and_periodic_eval_keeps_regular_limit(self):
         self.run_wa(make_config(), curr_iter=4, full_eval=True)
         self.run_ewa(make_config(), curr_iter=4, full_eval=False)
 
-        self.assertEqual(self.eval_batch_counts, [3, 2])
+        self.assertEqual(self.eval_limits, [(3, None), (2, None)])
 
     def test_unset_or_large_cap_never_exceeds_available_batches(self):
         self.run_wa(make_config(final_eval_batches=None))
         self.run_ewa(make_config(final_eval_batches=50))
 
-        self.assertEqual(self.eval_batch_counts, [11, 11])
+        self.assertEqual(self.eval_limits, [(11, None), (11, None)])
+
+    def test_token_cap_is_shared_by_wa_and_ewa(self):
+        cfg = make_config(final_eval_batches=None, final_eval_tokens=4096)
+
+        self.run_wa(cfg)
+        self.run_ewa(cfg)
+
+        self.assertEqual(self.eval_limits, [(11, 4096), (11, 4096)])
 
 
 if __name__ == "__main__":

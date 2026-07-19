@@ -260,7 +260,16 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
 
     def test_sophia_and_mars_keep_special_constructor_parameters(self):
         sophia_opt, _, sophia_cfg = self._run_main(["--opt", "sophiag", "--sophia_rho", "0.08"])
-        mars_opt, _, mars_cfg = self._run_main(["--opt", "mars", "--mars_lr", "0.007"])
+        mars_opt, _, mars_cfg = self._run_main(
+            [
+                "--opt",
+                "mars",
+                "--mars_lr",
+                "0.007",
+                "--weight_decay",
+                "0.037",
+            ]
+        )
 
         self.assertEqual(type(sophia_opt).__name__, "SophiaG")
         self.assertEqual(sophia_opt.kwargs["rho"], 0.08)
@@ -269,6 +278,7 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         self.assertEqual(mars_opt.kwargs["lr"], 0.007)
         self.assertEqual(mars_opt.kwargs["betas"], (mars_cfg.mars_beta1, mars_cfg.mars_beta2))
         self.assertEqual(mars_opt.kwargs["lr_1d"], mars_cfg.lr)
+        self.assertEqual(mars_opt.kwargs["weight_decay_1d"], mars_cfg.weight_decay)
 
     def test_cadamw_keeps_cautious_constructor_parameters(self):
         opt, _, cfg = self._run_main(
@@ -574,6 +584,12 @@ class OptimizerAssemblyBehaviorTest(unittest.TestCase):
         _, scheduler, _ = self._run_main(["--opt", "adamw", "--scheduler", "none"])
 
         self.assertIsNone(scheduler)
+        for scheduler_name in ("none", "cos", "wsd"):
+            with self.subTest(opt="adafactor", scheduler=scheduler_name):
+                _, adafactor_scheduler, _ = self._run_main(
+                    ["--opt", "adafactor", "--scheduler", scheduler_name]
+                )
+                self.assertIsNone(adafactor_scheduler)
 
     def test_cos_inf_and_wsd_use_lambda_lr_for_standard_optimizers(self):
         for scheduler_name in ("cos_inf", "wsd"):
