@@ -21,7 +21,9 @@ case "${OPT_NAME}" in
         ;;
 esac
 
-REPO_DIR="${REPO_DIR:-/root/work/llm-optimizer-benchmark}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DEFAULT_REPO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
+REPO_DIR="${REPO_DIR:-${DEFAULT_REPO_DIR}}"
 CONDA_SH="${CONDA_SH:-/root/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-llmopt310}"
 PHYSICAL_GPU="${PHYSICAL_GPU:-1}"
