@@ -106,6 +106,27 @@ example.
 We [present](https://github.com/epfml/llm-optimizer-benchmark/tree/dev/scripts) scripts for reproducing our benchmarking results for 124M, 210M, 720M dense Llama-based models, and 520M MoEs.
 Set the [wandb logging](#using-wandb) and run those scripts to obtain the results as below.
 
+### 1B dense Llama extension
+
+This fork adds [1B recipes](scripts/1b) for the same 17 optimizer variants as
+[720M](scripts/720m). The model uses 24 layers, hidden size 1792, 14 attention
+heads, and a SwiGLU intermediate size of 4864: **1,026,086,656 parameters** with
+the existing 50304-token vocabulary and tied embeddings. This is the 1026M shape
+from [Appendix D.3, Table 2](https://arxiv.org/html/2509.01440v1#A4.T2) of the
+benchmark paper's timing study.
+
+The recipes keep sequence length 512 and a global batch of 1984 sequences
+(1,015,808 tokens per optimizer update), using CLI `--batch_size 62 --acc_steps 32`.
+Optimizer hyperparameters and the editable `--iterations 48000` script default
+are inherited from 720M; they are starting points, not tuned 1B convergence
+results. GN and Magma recipes use the supported single-device Python entry;
+the other recipes keep the existing `torchrun` style.
+
+For the model contract, training horizons, launch examples, and the complete
+custom-optimizer integration checklist, read the
+[1B benchmark handoff](docs/1b-benchmark.md). This is the entry document to share
+with collaborators and their coding agents.
+
 ### Gauss-Newton experiments
 
 This repo now includes two GN options:
@@ -121,6 +142,8 @@ Example scripts:
 - `scripts/210m/gn-full.sh`
 - `scripts/720m/gn-prox.sh`
 - `scripts/720m/gn-full.sh`
+- `scripts/1b/gn-prox.sh`
+- `scripts/1b/gn-full.sh`
 - `scripts/moe-520m/gn-prox.sh`
 - `scripts/moe-520m/gn-full.sh`
 

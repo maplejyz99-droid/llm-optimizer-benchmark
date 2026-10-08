@@ -26,6 +26,9 @@ class ScriptArgumentBehaviorTest(unittest.TestCase):
             REPO_ROOT / "scripts" / "124m" / "gn-prox.sh",
             REPO_ROOT / "scripts" / "210m" / "mars.sh",
             REPO_ROOT / "scripts" / "720m" / "adamw.sh",
+            REPO_ROOT / "scripts" / "1b" / "adamw.sh",
+            REPO_ROOT / "scripts" / "1b" / "gn-full.sh",
+            REPO_ROOT / "scripts" / "1b" / "adamw-magma.sh",
             REPO_ROOT / "scripts" / "moe-520m" / "adamw.sh",
         ]
 
@@ -66,7 +69,7 @@ class ScriptArgumentBehaviorTest(unittest.TestCase):
 
         self.assertEqual(manifest["version"], 1)
         self.assertEqual(manifest_paths, script_paths)
-        self.assertEqual(len(manifest_paths), 76)
+        self.assertEqual(len(manifest_paths), 93)
         self.assertEqual(
             [entry["path"] for entry in manifest["entries"] if entry.get("metadata_only")],
             ["scripts/124m/memory-probe-500step.sh"],
@@ -97,7 +100,7 @@ class ScriptArgumentBehaviorTest(unittest.TestCase):
                 f"manifest drifted from {entry['path']}",
             )
 
-        self.assertEqual(total_commands, 78)
+        self.assertEqual(total_commands, 95)
 
 
 if __name__ == "__main__":
