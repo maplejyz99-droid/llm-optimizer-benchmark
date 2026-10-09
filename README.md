@@ -1,435 +1,180 @@
-# Codebase: "Benchmarking Optimizers for Large Language Model Pretraining"
-[![arXiv](https://img.shields.io/badge/arXiv-2401.06766-b31b1b.svg)](https://arxiv.org/abs/2509.01440)
-[![BibTeX](https://img.shields.io/badge/BibTeX-Citation-green)](#contact--reference)
+# LLM Optimizer Benchmark
 
-The code is largely based on our framework [llm-baselines](https://github.com/epfml/llm-baselines) to do research on training LLMs as an extension of [nanoGPT](https://github.com/karpathy/nanogpt).
-See the updates regarding our codebase and repo [here](#news-).
+**面向大语言模型预训练的优化器研究与可复现实验平台。**
 
-This code comes jointly with reference:
+**简体中文** · [English](README.en.md)
 
-> Andrei Semenov, Matteo Pagliardini, Martin Jaggi.
+[实验配置](#实验配置) · [快速开始](#快速开始) · [运行与结果](#运行与结果) · [文档与开发](#文档与开发)
 
-Date: September 2025
+我们在统一的 Llama 训练框架中维护优化器基线、研究变体和实验配方，围绕验证损失、训练稳定性、计算开销与跨规模行为开展比较。当前工作涵盖 Muon 系列、Gauss–Newton 方法、预条件与参数选择实验，以及从 124M 到 1B 的 dense Llama 配置。
 
-**Abstract:**
-> The recent development of Large Language Models (LLMs) has been accompanied by an effervescence of novel ideas and methods to better optimize the loss of deep learning models. Claims from those methods are myriad: from faster convergence to removing reliance on certain hyperparameters. However, the diverse experimental protocols used to validate these claims make direct comparisons between methods challenging. This study presents a comprehensive evaluation of recent optimization techniques across standardized LLM pretraining scenarios, systematically varying model size, batch size, and training duration. Through careful tuning of each method, we provide guidance to practitioners on which optimizer is best suited for each scenario. For researchers, our work highlights promising directions for future optimization research. Finally, by releasing our code and making all experiments fully reproducible, we hope our efforts can help the development and rigorous benchmarking of future methods.
+这个仓库把算法实现和实验管理放在一起：每次运行记录代码版本、数据身份、有效优化配置、参数更新分组和评估协议，让曲线能够追溯到具体的训练过程。
 
-## News 🔔
+## 当前维护重点
 
-* **12/2025:** The EurIPS 2025 poster is available [here](https://andron00e.github.io/uploads/llm-optimizer-benchmark-eurips25.pdf).
-* **11/2025:** Added muP (for both GPT and Llama configurations), uniform and exponential weight averaging, special initialization of the MoE router. More informative logging during training, including RMS and angular updates of different layers. Added an option to train models with untied embeds. Added benchmarks for evaluating downstream performance, e.g., hellaswag, arc_challenge, gsm8k...
-* **10/2025:** [@Andron00e](https://github.com/Andron00e) will present this work at [EurIPS 2025](https://eurips.cc/) and at the workshop on [Benchmarking in AI](https://sites.google.com/view/benchmarking-and-evaluating-ai) in Copenhagen.
+- **优化器研究**：GN-Prox / GN-Full、Newton-Muon、SoftEq K=2000 Muon，以及 AdamW / Muon 的 Magma 变体。
+- **跨规模比较**：124M、210M、720M 和 1B dense Llama 配方，另有 520M MoE 实验入口。
+- **参数化实验**：标准参数化与 muP 的 Llama 路径，配套参数组检查、坐标检查和学习率扫描工具。
+- **可追溯运行**：FineWeb-30B 数据预检、统一启动器、版本化运行清单、评估记录、checkpoint 状态和行为测试。
 
-## Quickstart 
+实现入口、脚本配置与完整训练结果是不同层次的证据。各方法的适用范围见下文；性能结论应以对应的运行产物为准。
 
-Create a conda environment and install dependencies:
+## 优化器与研究路径
 
-```
-conda create -n env python=3.10
-conda activate env
-pip install -r requirements.txt
-```
+### 比较基线
 
-Run a simple training on the SlimPajama 6B dataset:
+当前 CLI 提供 AdamW、Muon、Distributed Muon、SOAP、SophiaG、Lion、AdEMAMix、ADOPT、MARS、Prodigy、Schedule-Free、Adafactor、LAMB 等选项。完整列表与参数以 [`src/config/base.py`](src/config/base.py) 为准，实际构造与参数分组见 [`src/main.py`](src/main.py)。
 
-```sh
-python ./src/main.py --config_format base --model llama
-```
+同名方法在不同实现中的参数分组、回退更新器和学习率策略可能不同。比较时应记录本仓库的实际实现；已有差异整理在[优化器实现审计](docs/optimizer-implementation-audit.md)中。
 
-The above command trains a 123.59M parameters model with the Llama-style architecture. To train the MoE model, use the ```---moe``` flag.
+### 研究变体
 
-### Dataset locations and downloads
+- **GN-Prox / GN-Full**：通过线性化或 Gauss–Newton 近似构造内层更新，使用 `--opt gn-prox` / `--opt gn-full`。当前训练入口限制为单设备。见 [GN-Full 实现说明](docs/gn-full-onepager.md)。
+- **Newton-Muon**：在 Muon 路径中加入激活协方差右预条件，使用 `--opt newton-muon`。当前仅支持单设备 dense `llama`。见 [Newton-Muon 说明](docs/newton-muon-onepager.md)。
+- **SoftEq K=2000 Muon**：使用 `--opt softeq-k2000-muon`，支持 dense `llama` / `mup_llama`。作为实验变体维护，正式比较前需完成 GPU 与 cutoff 附近的恢复验证。见 [SoftEq 接入说明](docs/softeq-k2000-muon-integration.md)。
+- **Magma**：使用 `--opt adamw-magma` / `--opt muon-magma` 研究参数选择干预。当前训练入口限制为单设备。
 
-Dataset paths are portable across machines. Pass `--datasets_dir` explicitly,
-or set `LLMOPT_DATASETS_DIR` to either a dataset directory or a parent containing
-the named dataset directories:
+## 实验配置
 
-```sh
-export LLMOPT_DATASETS_DIR=/path/to/llmopt/datasets
-python ./src/main.py --config_format base --model llama --dataset fineweb
-```
+- [124M](scripts/124m/)：基线比较、Newton-Muon / SoftEq 入口及显存探测脚本。
+- [210M](scripts/210m/) 与 [720M](scripts/720m/)：更大模型的优化器配方。
+- [1B](scripts/1b/)：17 个优化器变体的 dense Llama 配方，与 720M 配方集合对应。
+- [520M MoE](scripts/moe-520m/)：MoE 模型的实验配方；使用前仍需核对对应优化器的模型与分布式限制。
+- [muP 学习率扫描](scripts/repro/mup_readme_lr_sweep/README.md)：基于本仓库 Llama 训练栈的标准参数化 / muP 比较。
 
-An explicit `--datasets_dir` takes precedence over the environment variable. If
-neither is provided, the fallback remains `./src/data/datasets/`. Training never
-downloads missing FineWeb data implicitly: it fails with the checked paths and
-setup guidance. The legacy `sample-100BT` builder is available only with the
-explicit `--allow_dataset_download` flag; for large artifacts, prepare data as a
-separate operation instead of during training.
+**1B 比较配置**采用 24 层、隐藏维度 1792、14 个注意力头与 tied embeddings，共 **1,026,086,656 个可训练参数**。序列长度为 512，全局 batch 为 1984 条序列，每次更新处理 **1,015,808 个 token**。
 
-For formal optimizer comparisons on the versioned 30B-token artifact, validate
-the data identity before launching a benchmark script:
+1B 配方沿用 720M 超参数作为起点，尚不能据此宣称完成 1B 调优或获得优化器排名。脚本中的 48,000 次更新是可编辑的默认值；8,000、16,000 与 20,203 次更新的比较约定、训练预算及协作接入要求见 [1B 实验指南](docs/1b-benchmark.md)。
 
-```sh
-export LLMOPT_DATASETS_DIR=/path/to/llmopt/datasets
-python ./scripts/data/check_fineweb_30b.py
-bash ./scripts/124m/adamw.sh
+## 快速开始
+
+### 1. 安装
+
+训练以 Python 3.10 和 Linux / CUDA 环境为主；CPU 可用于小模型功能检查。
+
+```bash
+git clone https://github.com/maplejyz99-droid/llm-optimizer-benchmark.git
+cd llm-optimizer-benchmark
+
+conda create -n llmopt python=3.10 -y
+conda activate llmopt
+python -m pip install -r requirements.txt
 ```
 
-The preflight requires `fineweb-30B/train.bin`, `val.bin`, and `meta.json`, and
-verifies the GPT-2 tokenizer, `uint16` format, 30B training tokens, and 100M
-validation tokens without hashing or scanning the full token files. Machine-local
-symlinks under `src/data/datasets` are optional conveniences and are ignored by
-Git; they are not required for a fresh clone.
+[`requirements.txt`](requirements.txt) 是基础依赖列表，并非完整的 CUDA 环境锁定文件。请按机器配置匹配的 PyTorch / CUDA；[`requirements-ci.lock`](requirements-ci.lock) 专用于 Linux x86_64 / Python 3.10 的 CPU 行为测试。环境记录与复现边界见[复现说明](docs/reproducibility.md)。
 
-### Run artifacts and repository-visible outputs
+### 2. 跑通一个小模型
 
-Direct `python ./src/main.py ...` remains backward-compatible and writes below
-`./exps` unless `--results_base_folder` is supplied. For new benchmark runs, use
-the repository launcher so each run keeps its structured metrics, command,
-terminal log, lifecycle status, and optional GPU telemetry together:
+以下示例在 CPU 上执行 2 次 AdamW 更新，检查数据加载、模型构建、训练与评估链路。首次使用会下载 Tiny Shakespeare 数据，不需要 W&B。
 
-```sh
+```bash
+python ./src/main.py \
+  --config_format base --model llama --opt adamw \
+  --dataset shakespeare-char --device cpu --dtype float32 \
+  --n_layer 1 --n_head 2 --n_embd 64 --vocab_size 96 \
+  --sequence_length 32 --batch_size 2 --acc_steps 1 \
+  --iterations 2 --warmup_steps 1 --scheduler none \
+  --eval_interval 2 --eval_batches 1 --final_eval_batches 1 \
+  --latest_ckpt_interval 0 --permanent_ckpt_interval 0 \
+  --results_base_folder ./exps/readme-smoke \
+  --experiment_name adamw-cpu-smoke
+```
+
+重复运行时请使用新的 `--experiment_name`。这个示例用于功能检查，正式性能比较应在相同的 CUDA 环境和实验协议下进行。
+
+### 3. 准备比较数据
+
+当前 FineWeb 比较使用版本化的 **FineWeb-30B** 数据：GPT-2 tokenizer、`uint16` token 文件、30B 训练 token 与 100M 验证 token。数据目录需要包含 `train.bin`、`val.bin` 和 `meta.json`。
+
+```bash
+export LLMOPT_DATASETS_DIR=/path/to/fineweb-30B
+python ./scripts/data/check_fineweb_30b.py --json
+```
+
+将示例路径替换为实际数据目录，也可以指向包含 `fineweb-30B/` 的父目录。训练参数 `--datasets_dir` 优先于环境变量。预检核对元数据与文件大小，不扫描整个 token 文件；训练默认不会自动下载缺失的 FineWeb 数据。需要构建数据时，先查看 [`scripts/data/build_fineweb_30b.py`](scripts/data/build_fineweb_30b.py) 的参数并单独准备。
+
+## 运行与结果
+
+推荐通过启动器管理新实验，把原始运行产物与整理后的结果分别放在指定目录中：
+
+```bash
 python ./scripts/setup_runtime_paths.py \
   --runs-root /path/to/large-disk/llmopt/runs \
   --results-root /path/to/curated/llmopt-results
-
-python ./scripts/launch_run.py \
-  --runs-root /path/to/large-disk/llmopt/runs \
-  --suite benchmark/smoke \
-  --run-id adamw-124m-seed0 \
-  --gpu-ids 0 \
-  --monitor-gpu \
-  -- \
-  --config_format base --model llama --dataset slimpajama --opt adamw
 ```
 
-The setup command creates ignored `runs` and `results` symlinks in the clone, so
-large machine-local artifacts are visible in an editor without entering Git.
-The launcher owns `--results_base_folder` and `--experiment_name`; do not pass
-them after `--`. It never overwrites an existing run directory. See
-[`docs/running-benchmark.md`](docs/running-benchmark.md) for the output tree,
-background-launch pattern, DDP use, checkpoint boundary, and a complete SophiaG
-example.
-
-## Reproducibility
-
-We [present](https://github.com/epfml/llm-optimizer-benchmark/tree/dev/scripts) scripts for reproducing our benchmarking results for 124M, 210M, 720M dense Llama-based models, and 520M MoEs.
-Set the [wandb logging](#using-wandb) and run those scripts to obtain the results as below.
-
-### 1B dense Llama extension
-
-This fork adds [1B recipes](scripts/1b) for the same 17 optimizer variants as
-[720M](scripts/720m). The model uses 24 layers, hidden size 1792, 14 attention
-heads, and a SwiGLU intermediate size of 4864: **1,026,086,656 parameters** with
-the existing 50304-token vocabulary and tied embeddings. This is the 1026M shape
-from [Appendix D.3, Table 2](https://arxiv.org/html/2509.01440v1#A4.T2) of the
-benchmark paper's timing study.
-
-The recipes keep sequence length 512 and a global batch of 1984 sequences
-(1,015,808 tokens per optimizer update), using CLI `--batch_size 62 --acc_steps 32`.
-Optimizer hyperparameters and the editable `--iterations 48000` script default
-are inherited from 720M; they are starting points, not tuned 1B convergence
-results. GN and Magma recipes use the supported single-device Python entry;
-the other recipes keep the existing `torchrun` style.
-
-For the model contract, training horizons, launch examples, and the complete
-custom-optimizer integration checklist, read the
-[1B benchmark handoff](docs/1b-benchmark.md). This is the entry document to share
-with collaborators and their coding agents.
-
-### Gauss-Newton experiments
-
-This repo now includes two GN options:
-
-- `--opt gn-prox`: prox-linear (JVP-based) inner updates
-- `--opt gn-full`: full Gauss-Newton inner updates
-
-Example scripts:
-
-- `scripts/124m/gn-prox.sh`
-- `scripts/124m/gn-full.sh`
-- `scripts/210m/gn-prox.sh`
-- `scripts/210m/gn-full.sh`
-- `scripts/720m/gn-prox.sh`
-- `scripts/720m/gn-full.sh`
-- `scripts/1b/gn-prox.sh`
-- `scripts/1b/gn-full.sh`
-- `scripts/moe-520m/gn-prox.sh`
-- `scripts/moe-520m/gn-full.sh`
-
-Key GN flags:
-
-- `--gn_inner_iters`
-- `--gn_inner_lr`
-- `--gn_inner_b1`, `--gn_inner_b2`
-- `--gn_inner_wd` (proximal penalty on parameter delta)
-- `--gn_linesearch`, `--gn_ls_range`
-- `--gn_log_inner_steps`
-
-### Newton-Muon experiments
-
-This fork includes a single-card dense Llama Newton-Muon v1 option:
-
-- `--opt newton-muon`: Muon plus an activation-covariance right-preconditioner
-
-Example script:
-
-- `scripts/124m/newton-muon.sh`
-
-The 124M script is a small-memory entry using `batch_size=16` and `acc_steps=2`.
-It intentionally does not use `torchrun` or `--distributed_backend`, because this
-Newton-Muon v1 path only supports one device. The script keeps the benchmark-style
-`--wandb` placeholder; remove the `--wandb` flags for local runs without W&B.
-
-Key Newton-Muon flags:
-
-- `--newton_muon_precond_every`: refresh interval in optimizer steps / outer training iterations, not microsteps.
-- `--newton_muon_precond_ewma`: exponential moving average coefficient for activation covariance.
-- `--newton_muon_precond_init_diag`: initial diagonal value for covariance state.
-- `--newton_muon_precond_ridge_mult`, `--newton_muon_precond_eps`: inverse regularization.
-
-Preconditioner statistics are collected during training forward passes only, and
-only on refresh steps. They are not collected after backward. Evaluation forward
-passes do not update covariance: eval uses the normal path and the Llama forward
-only collects when `precond_flag` is true and the model is in training mode.
-
-Current limits: no DDP/multi-card, no MoE, and no `d-muon` semantic alignment.
-Mac CPU/MPS runs are smoke tests only; performance comparisons should be run on a
-single CUDA device.
-
-<p align="center">
-  <img src="assets/720m_losses_1.png" alt="SF, Signum, Lion, Sophia" width="30%" style="display:inline-block; margin: 5px;"/>
-  <img src="assets/720m_losses_2.png" alt="Prod, ADOPT, SOAP, AdamW" width="30%" style="display:inline-block; margin: 5px;"/>
-  <img src="assets/720m_losses_3.png" alt="Top 3" width="30%" style="display:inline-block; margin: 5px;"/>
-</p>
-
-**Figure:** results for 720M Llama-style models trained with a batch size of 1M tokens.
-
-<p align="center">
-  <img src="assets/moe_losses_1.png" alt="Sophia, SF, Signum, MARS" width="30%" style="display:inline-block; margin: 5px;"/>
-  <img src="assets/moe_losses_2.png" alt="Lion, Prod, AdamW, ADOPT" width="30%" style="display:inline-block; margin: 5px;"/>
-  <img src="assets/moe_losses_3.png" alt="Top 3 MoE" width="30%" style="display:inline-block; margin: 5px;"/>
-</p>
-
-**Figure:** results for 520M MoE models trained with a batch size of 130k tokens.
-
-## Less quick start
-
-Here are the possible parameters you can use (copypasted from `config/base.py`):
-
-```python
-# General training params
-parser.add_argument('--batch_size', default=32, type=int)
-parser.add_argument('--acc_steps', default=4, type=int)
-parser.add_argument('--seed', default=0, type=int) # random seed for the parameters
-parser.add_argument('--data_seed', default=1337, type=int) # random seed defining the data ordering
-parser.add_argument('--eval_interval', default=200, type=int)
-parser.add_argument('--full_eval_at', nargs="+", type=int)
-parser.add_argument('--eval_batches', default=64, type=int)
-parser.add_argument('--device', default='cuda:0', type=str) # see below to run on multiple GPUs
-parser.add_argument('--iterations', default=25000, type=int) # total number of training iterations
-parser.add_argument('--warmup_steps', default=300, type=int)
-parser.add_argument('--lr', default=1e-3, type=float)
-parser.add_argument('--wsd_final_lr_scale', default=0.0, type=float) # wsd scheduler
-parser.add_argument('--wsd_fract_decay', default=0.1, type=float) # wsd scheduler 
-parser.add_argument('--decay_type', default='linear', choices=['linear', 'cosine', 'exp', 'miror_cosine', 'square', 'sqrt'])
-parser.add_argument('--weight_decay', default=0.1, type=float) # I recommend you keep this value, else instabilities might arise
-parser.add_argument('--beta1', default=0.9, type=float) # adam parameter
-parser.add_argument('--beta2', default=0.95, type=float) # adam parameter
-parser.add_argument('--scheduler', default='cos', choices=['linear', 'cos', 'wsd', 'cos_inf', 'none'])
-parser.add_argument('--final_div_factor', default=1, type=float) # cosine and linear schedulers
-parser.add_argument('--cos_inf_steps', default=0, type=int) # cos_inf scheduler
-parser.add_argument('--opt', default='adamw', choices=['adamw', 'gn-prox', 'gn-full', 'cadamw', 'adamw-magma', 'sgd', 'muon', 'newton-muon', 'muon-magma', 'softeq-k2000-muon', 'soap', 'ademamix', 'lion', 'sf-adamw', 'sf-sgd', 'signsgd', 'signum', 'prodigy', 'sophiag', 'adopt', 'mars', 'adafactor', 'lamb', 'scion', 'scion-light', 'd-muon', 'muon-pytorch'])
-parser.add_argument('--eval_freq', default=200, type=int) # in iterations
-parser.add_argument('--results_base_folder', default="./exps", type=str) # where the checkpoints will be saved
-parser.add_argument('--grad_clip', default=0.0, type=float) # default value is 1.0 in nanoGPT
-parser.add_argument('--momentum', default=0.9, type=float)
-parser.add_argument('--shampoo_beta', default=-1.0, type=float)
-parser.add_argument('--precondition_frequency', default=10, type=int) #for SOAP and Sophia
-parser.add_argument('--max_precond_dim', default=10000, type=int)
-parser.add_argument('--merge_dims', default=False, type=bool) # merge dimensions till the product of the dimensions is less than or equal to max_precond_dim
-parser.add_argument('--precondition_1d', default=False, type=bool)
-parser.add_argument('--normalize_grads', default=False, type=bool)
-parser.add_argument('--soap_data_format', default='channels_first', type=str)
-parser.add_argument('--correct_bias', default=True, type=bool)
-parser.add_argument('--nesterov', default=False, type=bool) # whether to use Nesterov-style momentum 
-parser.add_argument('--muon_ns_steps', default=5, type=int) # the number of steps to use in the newton schulz, if it is iterative
-parser.add_argument('--muon_lr_factor', default=0.02, type=float) # a factor by which to reduce the lr for muon
-parser.add_argument('--newton_muon_precond_every', default=32, type=int)
-parser.add_argument('--newton_muon_precond_ewma', default=0.95, type=float)
-parser.add_argument('--newton_muon_precond_init_diag', default=1e-3, type=float)
-parser.add_argument('--newton_muon_precond_ridge_mult', default=0.2, type=float)
-parser.add_argument('--newton_muon_precond_eps', default=1e-8, type=float)
-parser.add_argmunet('--adema_beta3', default=0.9, type=float) # beta3 in AdEMAMix
-parser.add_argument('--adema_alpha', default=2.0, type=float) # alpha in AdEMAMix
-parser.add_argument('--adema_beta3_warmup', default=None, type=int) # AdEMAMix hyperparameter
-parser.add_argument('--adema_alpha_warmup', default=None, type=int) # AdEMAMix hyperparameter
-parser.add_argument('--schedulefree_r', defalut=0.0, type=float) # schedulefree hyperparameter
-parser.add_argument('--weight_lr_power', default=2.0, type=float) # schedulefree hyperparameter
-parser.add_argument('--log_interval', default=50, type=int)
-parser.add_argument('--dampening', default=0.0, type=float)
-parser.add_argument('--prodigy_beta3', default=None, type=float) # coefficients for computing the Prodidy stepsize using running averages
-parser.add_argument('--prodigy_decouple', default=True, type=bool) # Use AdamW style decoupled weight decay
-parser.add_argument('--prodigy_use_bias_correction', default=False, type=bool)
-parser.add_argument('--prodigy_safeguard_warmup', default=False, type=bool) # Remove lr from the denominator of D estimate to avoid issues during warm-up stage. Off by default.
-parser.add_argument('--prodigy_fsdp_in_use', default=False, type=bool)
-parser.add_argument('--sophia_rho', default=0.04, type=float)
-parser.add_argument('--mars_type', default='mars-adamw', choices=['mars-adamw', 'mars-lion', 'mars-shampoo'],)
-parser.add_argument('--mars_vr_gamma', default=0.025, type=float)
-parser.add_argument('--mars_is_approx', default=True, type=float)
-parser.add_argument('--mars_lr', default=3e-3, type=float)
-parser.add_argument('--mars_beta1', default=0.95, type=float)
-parser.add_argument('--mars_beta2', default=0.99, type=float)
-parser.add_argument('--adafactor_decay_rate', default=-0.8, type=float)
-parser.add_argument('--lamb_use_bias_correction', default=False, type=bool)
-parser.add_argument('--adopt_decouple', default=True, type=bool)
-parser.add_argument('--adopt_eps', default=1e-6, type=float)
-parser.add_argument('--scion_lmh_scale', default=10.0, type=float)
-parser.add_argument('--scion_emb_scale', default=1.0, type=float)
-parser.add_argument('--scion_tr_scale', default=3.0, type=float)
-parser.add_argument('--weight_average', action='store_true') # uniform weight averaging (or SWA)
-parser.add_argument('--wa_interval', default=5, type=int, help='How often to take the average (every k steps). Must divide wa-horizon.')
-parser.add_argument('--wa_horizon', default=500, type=int, help='How frequently we save uniform model averages. Should divide '
-+ 'latest-ckpt-interval, otherwise some points may not be saved ' + 'correctly.')
-parser.add_argument('--wa_dtype', default='float32', type=str, choices=['float32', 'float64'])
-parser.add_argument('--wa_use_temp_dir', action='store_true')
-parser.add_argument('--wa_sweep_horizon', action='store_true')
-parser.add_argument('--max_num_wa_sweeps', default=5, type=int)
-parser.add_argument('--exponential_weight_average', action='store_true') # EMA of weights
-parser.add_argument('--ewa_interval', default=10, type=int, help='How often to take the EWA average (every k steps).')
-parser.add_argument('--ewa_decay', default=0.95, type=float, help='EWA decay parameter (between 0.9 and 1).')
-parser.add_argument('--ewa_after_warmup', action='store_true', help='Start EWA after warmup steps.')
-# Dataset params
-parser.add_argument('--dataset', default='slimpajama', choices=['slimpajama', 'wikitext', 'shakespeare-char', 'arxiv', 'arxiv2000', 'arxiv+wiki', 'openwebtext2', 'redpajama', 'redpajamav2', 'fineweb', 'finewebedu', 'c4', 'arc_easy', 'arc_challenge', 'hellaswag', 'logiqa', 'piqa', 'sciq', 'humaneval', 'gsm8k', 'kodcode', 'mathqa', 'medqa'])
-parser.add_argument('--tokenizer', default='gpt2', type=str, choices=['gpt2', 'mistral'])
-parser.add_argument('--vocab_size', default=50304, type=int)
-parser.add_argument('--data_in_ram', action='store_true') # force the data to RAM, you most likely do not need this  
-# Model params
-parser.add_argument('--model', default='base', choices=['base', 'llama', 'mup_gpt', 'mup_llama',])
-parser.add_argument('--parallel_block', action='store_true')
-parser.add_argument('--use_pretrained', default='none', type=str) # 'none', 'gpt2' or a path to the pretraind model
-parser.add_argument('--from_dense', action='store_true')
-parser.add_argument('--init_std', default=0.02, type=float)
-parser.add_argument('--dropout', default=0.0, type=float) # keep to 0 unless in low data regime (e.g. wikitext)
-parser.add_argument('--n_head', default=12, type=int)
-parser.add_argument('--n_layer', default=12, type=int) # depth in (att + ff) blocks
-parser.add_argument('--n_embd', default=768, type=int) # hidden size ... 
-parser.add_argument('--sequence_length', default=512, type=int)
-parser.add_argument('--dtype', default='bfloat16', type=str, choices=['float32', 'float16', 'bfloat16'],)
-parser.add_argument('--bias', default=False, type=bool)
-parser.add_argument('--compile', action='store_true') # if true then model is compiled
-parser.add_argument('--untied_embeds', action='store_true') # disables weight tying between lm_head.weight and wte.weight
-parser.add_argument('--rmsnorm_eps', default=1e-5, type=float) # used by the llama model
-parser.add_argument('--multiple_of', default=256, type=int) # used by the llama model make SwiGLU hidden layer size multiple of large power of 2
-parser.add_argument('--moe', action='store_true')
-parser.add_argument('--moe_routing', default='standard_gating', type=str, choices=['standard_gating', 'expert_choice'],)
-parser.add_argument('--moe_num_experts', default=8, type=int)
-parser.add_argument('--capacity_factor', default=2.0, type=float) # only used for expert choice routing
-parser.add_argument('--moe_num_shared_experts', default=0, type=int) # deepseek routing, experts that are always active
-parser.add_argument('--moe_router_loss', default='load_balancing_z_loss', type=str, choices=['entropy', 'load_balancing_only', 'load_balancing_z_loss'],)
-parser.add_argument('--moe_num_experts_per_tok', default=2, type=int)
-parser.add_argument('--moe_entropy_loss_factor', default=0.01, type=float)
-parser.add_argument('--moe_aux_loss_factor', default=0.1, type=float)
-parser.add_argument('--moe_z_loss_factor', default=0.01, type=float)
-parser.add_argument('--moe_softmax_order', type=str, default='topk_softmax', choices=['softmax_topk', 'topk_softmax'],)
-parser.add_argument('--plot_router_logits', action='store_true')
-parser.add_argument('--scale_emb', default=10, type=int) # mup arguments --- the base model width that mup has been configured on
-parser.add_argument('--scale_base_model', default=256, type=int)
-parser.add_argument('--scale_depth', default=1.4, type=float)
-# Checkpointing
-parser.add_argument('--results_base_folder', default='./exps', type=str)
-parser.add_argument('--permanent_ckpt_interval', default=0, type=int)
-parser.add_argument('--latest_ckpt_interval', default=0, type=int)
-parser.add_argument('--resume_from', default=None, type=str)
-parser.add_argument('--resume_from_swa', default=None, type=str)
-parser.add_argument('--auto_resume', default=True)
-# logging params (WandB)
-parser.add_argument('--wandb', action='store_true') # whether to use wandb or not
-parser.add_argument('--wandb_project', default='my-project', type=str)
-parser.add_argument('--wandb_entity', default=None, type=none_or_str) # for the team projects
-parser.add_argument('--wandb_run_prefix', default='none', type=str) # is added before the autogenerated experiment name
-parser.add_argument('--eval_seq_prefix', default="Once upon a time", type=str) # prefix used to generate sequences
-parser.add_argument('--log_dynamics', action='store_true')
-parser.add_argument('--dynamics_logger_cfg', default='./src/logger/rotational_logger.yaml', type=str)
-parser.add_argument('--log_parameter_norms', action='store_true') # logs the L2 norm of the parameters
-parser.add_argument('--norm_order', default=2) # order of the model norm to log
-# Distributed args
-parser.add_argument('--distributed_backend', default=None, type=str, required=False,
-                    choices=distributed.registered_backends())  # distributed backend type (e.g. nccl)
-```
-
-## Using WandB
-
-You need to give your wandb authorize key in order to send the data to your wandb account. If you start jobs on a server without access to prompt, then you can set the `WANDB_API_KEY` variable within your script:
+该命令创建被 Git 忽略的 `runs/`、`results/` 本地链接。完成数据预检后，可先预览一个 124M AdamW 的 20 步 CUDA 功能检查命令：
 
 ```bash
-# this is a script that could be executed on a server
-pip install -r requirements.txt # install req.
-export WANDB_API_KEY="put your authorize key here, to find it: https://wandb.ai/authorize"
-python ./src/main.py --config_format base --wandb --wandb_project "my awesome project" --n_layer 7 --model llama --seed 123
+python ./scripts/launch_run.py \
+  --runs-root /path/to/large-disk/llmopt/runs \
+  --suite smoke/fineweb30b \
+  --run-id adamw-124m-20steps-seed0 \
+  --gpu-ids 0 --monitor-gpu --dry-run \
+  -- \
+  --config_format base --model llama --opt adamw \
+  --dataset fineweb --device cuda:0 --dtype bfloat16 \
+  --n_layer 12 --n_head 12 --n_embd 768 \
+  --sequence_length 512 --batch_size 1 --acc_steps 1 \
+  --iterations 20 --warmup_steps 2 --scheduler cos \
+  --lr 1e-3 --weight_decay 0.1 --seed 0 --data_seed 1337 \
+  --eval_interval 10 --eval_batches 1 --final_eval_batches 1
 ```
 
-## How to add your own transformer architecture? 
+`--dry-run` 只打印命令，不启动训练或创建运行目录。确认路径、环境和显存后，移除该选项即可执行。此处 batch、训练长度和评估上限仅用于功能检查；正式比较请采用统一的[实验配方](#实验配置)与评估协议。
 
-The structure of the project is the following: 
+每次运行使用新的 `--run-id`。启动器管理 `--results_base_folder` 和 `--experiment_name`，不要在分隔符 `--` 后重复传入这两个参数。
 
-```sh
-src/
-    main.py         # pick the right data, model, optimizer, and training function
-    config/
-        __init__.py # contains CONFIG_FORMAT_TO_MODULE_MAP mapping the name given to the --config_format flag with a python conf file
-        base.py     # config for the base model
-    data/
-        utils.py    # contains the get_dataset function
-        fineweb.py # load/process fineweb
-        fineweb_edu.py    # load/process fineweb edu
-        shakespeare.py # load/process the Shakespeare dataset
-        benchmarks.py # load/process benchs, e.g., hellaswag, gsm8k, arc_challenge
-        c4.py # load/process the c4 dataset
-        slimpajama.py
-        ...
-    models/
-        utils.py    # contains the get_model function
-        base.py     # contains the standard transformer base architecture
-        llama.py    # llama architecture
-        mup.py # implementation of muP
-        mup_llama.py # muP-styled llama architecture
-    optim/
-        utils.py    # contains eval and get_batch functions
-        base.py     # training function for the base and llama models
-        ...
-    distributed/
-        # code to enable simple distributed training
+运行产物包括：
+
+- `run_manifest.json`：配置、代码与数据身份、有效优化计划、实际参数更新分组。
+- `summary.json` 与 `evaluations/`：训练指标、验证指标及版本化评估记录。
+- `launch/` 与 `logs/`：启动命令、生命周期状态、终端日志和可选 GPU 采样。
+- `ckpts/`：在启用 checkpoint 间隔时保存的训练状态。
+
+启动器会核对运行清单与结果文件的一致性后再标记完成。后台运行、多 GPU、输出结构和恢复限制见[运行指南](docs/running-benchmark.md)。
+
+## 比较约定
+
+- 固定数据版本、模型配置、训练 token 预算、seed 集合与评估协议，同时报告实际执行配置和计算开销。
+- 本仓库 CLI 的 `--batch_size` 与 `--acc_steps` 的乘积已表示全局序列 batch；DDP 会在进程间分配，**不要再乘 GPU 数量**。该乘积需能被进程数整除。
+- GN、Newton-Muon 与 Magma 当前走单设备入口；通过启动器使用时，省略 `--nproc-per-node` 和 `--distributed_backend`。配方使用 `torchrun` 本身不代表分布式语义已全面验证。
+- Schedule-Free 方法使用 `--scheduler none`。不同 Muon 变体的矩阵更新、weight decay 和 AdamW 回退策略应分别记录。
+- 现有 shell 配方含 W&B 占位参数，运行前需填写或移除相应选项。它们不会转发附加位置参数；修改训练长度时应编辑命令，不能仅在 `bash scripts/1b/adamw.sh` 后追加选项。
+- 断点恢复需满足数据、配置、运行身份和 checkpoint 状态契约。启动器每次创建新运行，直接训练入口的恢复用法见[复现说明](docs/reproducibility.md)。
+
+## 文档与开发
+
+- [1B 实验指南](docs/1b-benchmark.md)：模型配置、训练预算、启动示例与新增优化器接入清单。
+- [运行指南](docs/running-benchmark.md)：启动器、日志、输出目录、GPU 监控与 checkpoint 边界。
+- [复现说明](docs/reproducibility.md)：环境记录、CPU 依赖锁定、运行身份、恢复与 CI。
+- [优化器实现审计](docs/optimizer-implementation-audit.md)：本地实现与来源声明、已知差异及验证范围。
+- [muP 学习率扫描](scripts/repro/mup_readme_lr_sweep/README.md)：参数化比较与绘图流程。
+
+实现主要位于 [`src/models/`](src/models/)、[`src/optim/`](src/optim/)、[`src/config/`](src/config/) 与 [`src/main.py`](src/main.py)；运行身份由 [`src/run_manifest.py`](src/run_manifest.py) 管理。新增优化器时，请同时更新 CLI、构造逻辑、有效优化计划、实验配方与行为测试，接入细节见 1B 实验指南。
+
+在已按复现说明安装依赖的 **Linux CPU 测试环境**中运行：
+
+```bash
+python repro/verify_cpu_environment.py
+python repro/run_behavior_tests.py full
+python repro/run_behavior_tests.py isolated
+python repro/run_behavior_tests.py reverse
 ```
 
-Given the above structure, to add your own model, you can just fork the `./src/models/base.py` file, do your modifications, then if necessary fork the `./src/optim/base.py` in case you need some custom training loop or evaluation. You also need to fork the `./src/config/base.py` file to add your own parameters, which imply adding your new config to the mapping `CONFIG_FORMAT_TO_MODULE_MAP` in `./src/config/__init__.py`. To add a new dataset, create a new file in the `data` folder, check `wikitext.py` for the expected format. 
+测试分别覆盖整体运行、模块隔离与逆序执行。分布式集成测试和 CI 配置见 [`tests/integration/`](tests/integration/) 与 [GitHub Actions](https://github.com/maplejyz99-droid/llm-optimizer-benchmark/actions)。CPU 行为测试通过不等同于完成 CUDA 性能或收敛验证。
 
-**Note:** we use [black](https://black.readthedocs.io/en/stable/the_black_code_style/current_style.html) and [isort](https://pycqa.github.io/isort/) for all pull requests. Before committing your code, simply run ```black . && isort .``` and you will be fine.
+代码与文档改进请通过[本仓库 Pull Requests](https://github.com/maplejyz99-droid/llm-optimizer-benchmark/pulls)提交与讨论。
 
-## Multi-GPU training
+## 来源、许可与引用
 
-Given a multi-GPU machine with e.g. 4 GPUs, one can distribute the training using data-parallelism:
+本项目在 [EPFL 的 llm-optimizer-benchmark](https://github.com/epfml/llm-optimizer-benchmark) 基础上持续开发，继承了其训练框架与基线实现，并在此基础上维护本仓库的研究变体、实验配置和复现工具。感谢上游作者，以及 [llm-baselines](https://github.com/epfml/llm-baselines) 和 [nanoGPT](https://github.com/karpathy/nanoGPT) 的贡献。
 
-```sh
-torchrun --nproc_per_node=4 ./src/main.py --config_format base --distributed_backend nccl --dataset slimpajama --model base
-```
+项目采用 [Apache-2.0 许可证](LICENSE)，保留上游与第三方实现的来源说明。使用上游论文的基准设计或结果时，请引用原论文；使用本仓库新增实现时，请同时注明仓库地址与具体 commit。
 
-When using multiple GPUs, the global `batch_size * acc_steps` is split across
-workers. That product must be divisible by the number of GPUs. The backend uses
-the greatest common divisor to adjust both per-rank batch size and accumulation;
-for example, `batch_size=32`, `acc_steps=1`, and two GPUs becomes batch size 16
-per rank with one accumulation step.
+上游论文：[Benchmarking Optimizers for Large Language Model Pretraining](https://arxiv.org/abs/2509.01440)，Andrei Semenov、Matteo Pagliardini、Martin Jaggi，2025。
 
-## Experimenting locally on your device with CPU
-If do not have access to a GPU or just want to try the code locally on your device, you can try the Shakespeare dataset with character-level tokens:
-
-```sh
-python ./src/main.py --n_layer=2 --n_head=4 --n_embd=128 --sequence_length=256 --dataset=shakespeare-char --device=cpu --vocab_size=96
-```
-
-SoftEq K=2000 Muon is available as `--opt softeq-k2000-muon` for dense
-`llama` / `mup_llama` smoke and benchmark runs. See
-[`docs/softeq-k2000-muon-integration.md`](docs/softeq-k2000-muon-integration.md)
-for implementation scope and GPU validation requirements.
-
-**We believe the details provided are clear enough to reproduce the main findings of our paper.**
-
-
-## Contact & Reference
-
-Please do not hesitate to reach out to us if you have questions. And feel free to open an [issue](https://github.com/epfml/llm-optimizer-benchmark/issues).
-
-```bib
+```bibtex
 @article{semenov2025benchmarking,
   title={Benchmarking {O}ptimizers for {L}arge {L}anguage {M}odel {P}retraining},
   author={Semenov, Andrei and Pagliardini, Matteo and Jaggi, Martin},
